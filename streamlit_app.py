@@ -77,6 +77,64 @@ def search_articles(query, articles, top_k=5):
     top_idx = sims.argsort()[::-1][:top_k]
     results = [(articles[i], float(sims[i])) for i in top_idx if sims[i] > 0]
     return results
+    def build_tfidf_index(articles):
+        """Build a TF-IDF index from articles."""
+        if not articles:
+            return None, None
+        texts = [a.get("text", "") or a.get("abstract", "") or "" for a in articles]
+    
+        # Filter out empty/whitespace-only texts
+        texts = [t.strip() for t in texts]
+    
+        # If all texts are empty or only stop words, return None
+        if not any(texts):
+            return None, None
+    
+        try:
+            vectorizer = TfidfVectorizer(stop_words="english", max_features=5000, min_df=1)
+            X = vectorizer.fit_transform(texts)
+            return vectorizer, X
+        except ValueError:
+            # Empty vocabulary (all stop words) — fallback to None
+            return None, None
+
+    def search_articles(query, articles, top_k=5):
+        """Search articles using TF-IDF similarity, with fallback to keyword matching."""
+        if not articles:
+            return []
+    
+        vectorizer, X = build_tfidf_index(articles)
+    
+        # If TF-IDF fails, use simple keyword matching as fallback
+        if vectorizer is None:
+            query_lower = query.lower()
+            scored = []
+            for i, article in enumerate(articles):
+                title = article.get("title", "").lower()
+                abstract = article.get("abstract", "").lower()
+                text = article.get("text", "").lower()
+            
+                # Simple keyword match score
+                score = 0
+                if query_lower in title:
+                    score += 2.0
+                score += title.count(query_lower) * 0.5
+                score += abstract.count(query_lower) * 0.3
+                score += text.count(query_lower) * 0.1
+            
+                if score > 0:
+                    scored.append((i, score))
+        
+            scored.sort(key=lambda x: x[1], reverse=True)
+            results = [(articles[i], score) for i, score in scored[:top_k]]
+            return results
+    
+        # TF-IDF search
+        q_vec = vectorizer.transform([query])
+        sims = cosine_similarity(q_vec, X).flatten()
+        top_idx = sims.argsort()[::-1][:top_k]
+        results = [(articles[i], float(sims[i])) for i in top_idx if sims[i] > 0]
+        return results
 
 def call_openai_analysis(query, articles_text, api_key):
     """Call OpenAI to analyze search results and answer the query."""
