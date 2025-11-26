@@ -200,7 +200,7 @@ def call_openai_analysis(query, articles_text, api_key):
 
 def run_app():
     st.set_page_config(page_title="Agile Biofoundry Search", layout="wide")
-    st.title("🧬 Agile Biofoundry — Article Search & Analysis")
+    st.title("Agile Biofoundry — Article Search & Analysis")
 
     # Sidebar: Add article form
     st.sidebar.header("Add Article")
@@ -266,7 +266,7 @@ def run_app():
 
             # AI analysis
             st.divider()
-            st.subheader("🤖 AI Analysis")
+            st.subheader("AI Analysis")
             api_key = get_openai_client()
             
             if api_key:
@@ -275,7 +275,7 @@ def run_app():
                         f"**{a['title']}** by {', '.join(a['authors']) if a.get('authors') else 'Unknown'}\n{a.get('text') or a.get('abstract') or 'No content'}"
                         for a, _ in results
                     ])
-                    with st.spinner("🔄 Analyzing articles with AI..."):
+                    with st.spinner("Analyzing articles with AI..."):
                         analysis = call_openai_analysis(query, articles_context, api_key)
                     st.write(analysis)
             else:
@@ -295,25 +295,41 @@ def run_app():
                         delete_article(article['id'])
                         st.rerun()
 
-    # Sidebar: Scan articles' URLs and extract HTML text
-    if st.sidebar.button("🔎 Scan article URLs and extract HTML text"):
-        with st.spinner("Scanning article URLs..."):
+    # Sidebar: Scan articles' URLs and extract HTML text with verbose logging
+    if st.sidebar.button("Scan article URLs and extract HTML text"):
+        with st.spinner("Scanning article URLs and extracting text..."):
             articles = load_articles()
+            log_lines = []
             updated = 0
             for a in articles:
                 # skip if already has text
                 if a.get("text"):
+                    log_lines.append(f"⏭**{a['title']}** — already has text, skipping")
                     continue
                 url = a.get("url") or ""
                 if not url or not isinstance(url, str):
+                    log_lines.append(f"**{a['title']}** — no URL provided")
                     continue
                 extracted = fetch_and_extract_html(url)
                 if extracted and len(extracted) > 200:
                     a["text"] = extracted
                     updated += 1
+                    log_lines.append(f"**{a['title']}** — extracted {len(extracted)} chars from `{url[:60]}...`")
+                elif extracted:
+                    log_lines.append(f"**{a['title']}** — extracted only {len(extracted)} chars (min 200) from `{url[:60]}...`")
+                else:
+                    log_lines.append(f"**{a['title']}** — failed to extract from `{url[:60]}...`")
             if updated:
                 save_articles(articles)
-        st.experimental_rerun()
+        
+        # Display results in main area
+        st.divider()
+        st.subheader("Scan Results")
+        st.success(f"Updated **{updated}** articles with extracted text.")
+        with st.expander("View detailed scan log", expanded=True):
+            for line in log_lines:
+                st.markdown(line)
+        st.rerun()
 
 if __name__ == "__main__":
     run_app()
