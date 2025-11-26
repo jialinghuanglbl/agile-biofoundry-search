@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime
 
 import requests
+from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -56,85 +57,120 @@ def delete_article(article_id):
     articles = [a for a in articles if a["id"] != article_id]
     save_articles(articles)
 
+
+def fetch_and_extract_html(url: str) -> str:
+    """Fetch a URL and heuristically extract the main article text using BeautifulSoup.
+
+    Strategy:
+    - Try to find an <article> tag
+    - Else try to find tag with role="main" or <main>
+    - Else extract all <p> text and return the largest contiguous block
+    """
+    try:
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "agile-biofoundry-bot/1.0"})
+        resp.raise_for_status()
+        html = resp.content
+    except Exception:
+        return ""
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return ""
+
+    # 1) <article>
+    article_tag = soup.find("article")
+    if article_tag:
+        text = article_tag.get_text(separator="\n", strip=True)
+        if len(text) > 200:
+            return text
+
+    # 2) main or role=main
+    main_tag = soup.find("main") or soup.find(attrs={"role": "main"})
+    if main_tag:
+        text = main_tag.get_text(separator="\n", strip=True)
+        if len(text) > 200:
+            return text
+
+    # 3) find the largest <div> or section by text length
+    candidates = soup.find_all(["div", "section", "article", "main"])
+    best = ""
+    for c in candidates:
+        t = c.get_text(separator="\n", strip=True)
+        if len(t) > len(best):
+            best = t
+    if len(best) > 200:
+        return best
+
+    # 4) fallback: join all paragraph text
+    ps = [p.get_text(separator=" ", strip=True) for p in soup.find_all("p")]
+    if not ps:
+        return ""
+    # return the longest contiguous paragraph block (join all)
+    joined = "\n\n".join(ps)
+    return joined
+
 def build_tfidf_index(articles):
     """Build a TF-IDF index from articles."""
     if not articles:
         return None, None
     texts = [a.get("text", "") or a.get("abstract", "") or "" for a in articles]
-    vectorizer = TfidfVectorizer(stop_words="english", max_features=5000)
-    X = vectorizer.fit_transform(texts)
-    return vectorizer, X
+
+    # Strip and normalize
+    texts = [t.strip() for t in texts]
+
+    # If all texts are empty, there's nothing to vectorize
+    if not any(texts):
+        return None, None
+
+    try:
+        vectorizer = TfidfVectorizer(stop_words="english", max_features=5000, min_df=1)
+        X = vectorizer.fit_transform(texts)
+        return vectorizer, X
+    except ValueError:
+        # Empty vocabulary (e.g., documents only contain stop words)
+        return None, None
+
 
 def search_articles(query, articles, top_k=5):
-    """Search articles using TF-IDF similarity."""
+    """Search articles using TF-IDF similarity, with fallback to keyword matching."""
     if not articles:
         return []
+
     vectorizer, X = build_tfidf_index(articles)
+
+    # If TF-IDF failed (empty vocab), fall back to simple keyword matching
     if vectorizer is None:
-        return []
+        query_lower = query.lower()
+        scored = []
+        for i, article in enumerate(articles):
+            title = article.get("title", "").lower()
+            abstract = article.get("abstract", "").lower()
+            text = article.get("text", "").lower()
+
+            score = 0.0
+            if query_lower in title:
+                score += 2.0
+            score += title.count(query_lower) * 0.5
+            score += abstract.count(query_lower) * 0.3
+            score += text.count(query_lower) * 0.1
+
+            if score > 0:
+                scored.append((i, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        results = [(articles[i], score) for i, score in scored[:top_k]]
+        return results
+
+    # TF-IDF search
     q_vec = vectorizer.transform([query])
     sims = cosine_similarity(q_vec, X).flatten()
     top_idx = sims.argsort()[::-1][:top_k]
     results = [(articles[i], float(sims[i])) for i in top_idx if sims[i] > 0]
     return results
-    def build_tfidf_index(articles):
-        """Build a TF-IDF index from articles."""
-        if not articles:
-            return None, None
-        texts = [a.get("text", "") or a.get("abstract", "") or "" for a in articles]
-    
-        # Filter out empty/whitespace-only texts
-        texts = [t.strip() for t in texts]
-    
-        # If all texts are empty or only stop words, return None
-        if not any(texts):
-            return None, None
-    
-        try:
-            vectorizer = TfidfVectorizer(stop_words="english", max_features=5000, min_df=1)
-            X = vectorizer.fit_transform(texts)
-            return vectorizer, X
-        except ValueError:
-            # Empty vocabulary (all stop words) — fallback to None
-            return None, None
-
-    def search_articles(query, articles, top_k=5):
-        """Search articles using TF-IDF similarity, with fallback to keyword matching."""
-        if not articles:
-            return []
-    
-        vectorizer, X = build_tfidf_index(articles)
-    
-        # If TF-IDF fails, use simple keyword matching as fallback
-        if vectorizer is None:
-            query_lower = query.lower()
-            scored = []
-            for i, article in enumerate(articles):
-                title = article.get("title", "").lower()
-                abstract = article.get("abstract", "").lower()
-                text = article.get("text", "").lower()
-            
-                # Simple keyword match score
-                score = 0
-                if query_lower in title:
-                    score += 2.0
-                score += title.count(query_lower) * 0.5
-                score += abstract.count(query_lower) * 0.3
-                score += text.count(query_lower) * 0.1
-            
-                if score > 0:
-                    scored.append((i, score))
-        
-            scored.sort(key=lambda x: x[1], reverse=True)
-            results = [(articles[i], score) for i, score in scored[:top_k]]
-            return results
-    
-        # TF-IDF search
-        q_vec = vectorizer.transform([query])
-        sims = cosine_similarity(q_vec, X).flatten()
-        top_idx = sims.argsort()[::-1][:top_k]
-        results = [(articles[i], float(sims[i])) for i in top_idx if sims[i] > 0]
-        return results
 
 def call_openai_analysis(query, articles_text, api_key):
     """Call OpenAI to analyze search results and answer the query."""
@@ -258,6 +294,26 @@ def run_app():
                     if st.button("🗑️", key=f"del_{article['id']}", help="Delete"):
                         delete_article(article['id'])
                         st.rerun()
+
+    # Sidebar: Scan articles' URLs and extract HTML text
+    if st.sidebar.button("🔎 Scan article URLs and extract HTML text"):
+        with st.spinner("Scanning article URLs..."):
+            articles = load_articles()
+            updated = 0
+            for a in articles:
+                # skip if already has text
+                if a.get("text"):
+                    continue
+                url = a.get("url") or ""
+                if not url or not isinstance(url, str):
+                    continue
+                extracted = fetch_and_extract_html(url)
+                if extracted and len(extracted) > 200:
+                    a["text"] = extracted
+                    updated += 1
+            if updated:
+                save_articles(articles)
+        st.experimental_rerun()
 
 if __name__ == "__main__":
     run_app()
