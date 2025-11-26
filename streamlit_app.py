@@ -240,7 +240,7 @@ def run_app():
     with col1:
         query = st.text_input("Enter your search query or question:", placeholder="e.g., 'What are the key findings about cell growth?'")
     with col2:
-        top_k = st.slider("Results", 1, min(10, len(articles)), 3)
+        top_k = st.slider("Results", 1, min(10, len(articles)), 100)
 
     if query:
         st.divider()
