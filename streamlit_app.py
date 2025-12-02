@@ -420,14 +420,25 @@ def run_app():
     def parse_cookies(raw_input):
         if not raw_input:
             return ""
-        # Try to clean up and reformat
         lines = raw_input.strip().split("\n")
         pairs = []
         for line in lines:
             line = line.strip()
-            if "=" in line and not any(x in line for x in ["http", "curl", "name", "domain", "path", "secure"]):
-                # Looks like a name=value pair
+            if not line or line.startswith("#"):
+                continue
+            
+            # Handle tab-separated DevTools format (Name [TAB] Value [TAB] ...)
+            if "\t" in line:
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    name = parts[0].strip()
+                    value = parts[1].strip()
+                    if name and value and not any(x in name.lower() for x in ["domain", "path", "expires", "size", "http", "secure", "same"]):
+                        pairs.append(f"{name}={value}")
+            # Handle standard "name=value" format
+            elif "=" in line and not any(x in line for x in ["http", "curl", "domain", "path", "expires"]):
                 pairs.append(line)
+        
         return "; ".join(pairs)
     
     cookie_header = parse_cookies(cookie_input)
