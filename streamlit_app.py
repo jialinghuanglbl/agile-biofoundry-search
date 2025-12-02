@@ -196,15 +196,17 @@ def fetch_lean_library_links(page_url: str, cookie_header: str | None = None, li
     return results
 
 
-def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_header: str | None = None) -> list:
+def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_header: str | None = None, query_params: str | None = None) -> list:
     """Call a JSON API endpoint (the SPA XHR 'items' endpoint) and return a list of {url,title} dicts.
 
-    - `authorization` should be the full header value (e.g. 'Bearer <token>') or token string.
-    - `cookie_header` can supply cookies if needed.
+    - `authorization` (optional) — full header value (e.g. 'Bearer <token>') or token string.
+    - `cookie_header` (optional) — cookie string "name1=value1; name2=value2".
+    - `query_params` (optional) — query string like "collectionId=1054271&limit=100".
     """
     headers = {
-        "User-Agent": "agile-biofoundry-bot/1.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": endpoint,
     }
     if authorization:
         # allow either full 'Bearer ...' or bare token
@@ -221,8 +223,14 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
                 k, v = part.split("=", 1)
                 cookies[k.strip()] = v.strip()
 
+    # Add query params if provided
+    url = endpoint
+    if query_params:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{query_params}"
+
     try:
-        resp = requests.get(endpoint, headers=headers, timeout=30, cookies=cookies)
+        resp = requests.get(url, headers=headers, timeout=30, cookies=cookies)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -231,7 +239,7 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
     # Normalize data to a list of items
     items = []
     if isinstance(data, dict):
-        for key in ("items", "results", "data", "articles"):
+        for key in ("items", "results", "data", "articles", "content"):
             if key in data and isinstance(data[key], list):
                 items = data[key]
                 break
@@ -247,8 +255,8 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
     for a in items:
         if not isinstance(a, dict):
             continue
-        url = a.get("url") or a.get("link") or a.get("pdf_url") or a.get("pdf")
-        title = a.get("title") or a.get("name") or None
+        url = a.get("url") or a.get("link") or a.get("pdf_url") or a.get("pdf") or a.get("file") or a.get("uri")
+        title = a.get("title") or a.get("name") or a.get("article_title") or None
         if not url:
             continue
         if url in seen:
@@ -377,9 +385,10 @@ def run_app():
     # API endpoint / Authorization support (preferred for SPA)
     st.sidebar.markdown("---")
     st.sidebar.header("Optional: Use site API / XHR endpoint")
-    st.sidebar.info("If you see an XHR 'items' request in DevTools, paste its full request URL here and an Authorization token (if present). This is the most reliable method for private projects.")
-    api_endpoint = st.sidebar.text_input("API endpoint (paste XHR 'items' URL)", placeholder="https://sciwheel.com/api/.../items", key="lean_api_endpoint")
-    authorization_header = st.sidebar.text_input("Authorization header (optional)", placeholder="Bearer <token> or token", key="lean_api_auth")
+    st.sidebar.info("Paste the 'items' XHR endpoint URL. Auth is typically via cookies (session-based). If items need filtering, add query params like `?collectionId=1054271`.")
+    api_endpoint = st.sidebar.text_input("API endpoint (paste XHR 'items' URL)", placeholder="https://sciwheel.com/work/api/search/items", key="lean_api_endpoint")
+    query_params = st.sidebar.text_input("Query parameters (optional)", placeholder="collectionId=1054271&limit=100", key="lean_query_params")
+    authorization_header = st.sidebar.text_input("Authorization header (optional, usually not needed)", placeholder="Bearer <token> or token", key="lean_api_auth")
 
     with st.sidebar.expander("ℹ️ How to get the XHR token", expanded=False):
         st.markdown("""
@@ -414,7 +423,7 @@ def run_app():
         elif debug_btn:
             # Debug: show raw API response
             st.sidebar.info("Fetching raw API response...")
-            headers = {"User-Agent": "agile-biofoundry-bot/1.0", "Accept": "application/json"}
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
             if authorization_header:
                 if authorization_header.lower().startswith("bearer ") or ":" in authorization_header or authorization_header.count(" ") > 0:
                     headers["Authorization"] = authorization_header
@@ -427,19 +436,43 @@ def run_app():
                     if "=" in part:
                         k, v = part.split("=", 1)
                         cookies[k.strip()] = v.strip()
+            
+            # Build URL with query params
+            url = api_endpoint
+            if query_params:
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}{query_params}"
+            
+            # Show what we're sending
+            st.sidebar.write("**Request details:**")
+            st.sidebar.write(f"URL: `{url}`")
+            st.sidebar.write(f"Auth header: `{headers.get('Authorization', '(none)')}`")
+            st.sidebar.write(f"Cookies: `{len(cookies) if cookies else 0} cookies`")
+            
             try:
-                resp = requests.get(api_endpoint, headers=headers, timeout=30, cookies=cookies)
+                resp = requests.get(url, headers=headers, timeout=30, cookies=cookies)
+                st.sidebar.write(f"**Response status:** {resp.status_code}")
                 resp.raise_for_status()
                 raw_data = resp.json()
-                st.sidebar.success(f"✅ Status: {resp.status_code}")
+                st.sidebar.success(f"✅ Success")
                 st.sidebar.json(raw_data)
+            except requests.exceptions.HTTPError as e:
+                st.sidebar.error(f"❌ HTTP Error {e.response.status_code}: {e.response.reason}")
+                st.sidebar.write("**Tips:**")
+                st.sidebar.write("- For 401/403: Cookies may have expired. Re-copy from DevTools → Application → Cookies.")
+                st.sidebar.write("- Try adding query params like `collectionId=1054271` (the collection ID from your URL).")
+                st.sidebar.write("- The endpoint may require different query param names. Check DevTools Network tab for the actual XHR request URL parameters.")
+                try:
+                    st.sidebar.write(f"Response body: {e.response.text[:200]}")
+                except:
+                    pass
             except Exception as e:
                 st.sidebar.error(f"❌ Error: {str(e)}")
         elif fetch_btn:
             # Fetch: process and store links
             if api_endpoint:
                 with st.spinner("Fetching items via API..."):
-                    links = fetch_items_api(api_endpoint, authorization_header, cookie_header)
+                    links = fetch_items_api(api_endpoint, authorization_header, cookie_header, query_params)
             else:
                 with st.spinner("Fetching links from Lean Library page..."):
                     links = fetch_lean_library_links(lean_page, cookie_header)
