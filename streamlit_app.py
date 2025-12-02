@@ -401,10 +401,42 @@ def run_app():
 
     cookie_header = st.sidebar.text_area("Cookie header (for authenticated pages)", help="Paste cookie string like `name=value; name2=value2` if needed to access your Lean Library page.", key="lean_cookie")
     
-    col1, col2 = st.sidebar.columns(2)
+    # Buttons: Fetch and Debug
+    col1, col2, col3 = st.sidebar.columns(3)
     with col1:
-        if st.button("Fetch links from page"):
-            # Prefer API endpoint if provided
+        fetch_btn = st.button("🔄 Fetch links", key="btn_fetch")
+    with col2:
+        debug_btn = st.button("🐛 Debug API", key="btn_debug")
+    
+    if fetch_btn or debug_btn:
+        if debug_btn and not api_endpoint:
+            st.sidebar.error("Provide an API endpoint first.")
+        elif debug_btn:
+            # Debug: show raw API response
+            st.sidebar.info("Fetching raw API response...")
+            headers = {"User-Agent": "agile-biofoundry-bot/1.0", "Accept": "application/json"}
+            if authorization_header:
+                if authorization_header.lower().startswith("bearer ") or ":" in authorization_header or authorization_header.count(" ") > 0:
+                    headers["Authorization"] = authorization_header
+                else:
+                    headers["Authorization"] = f"Bearer {authorization_header}"
+            cookies = None
+            if cookie_header:
+                cookies = {}
+                for part in [p.strip() for p in cookie_header.split(";") if p.strip()]:
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        cookies[k.strip()] = v.strip()
+            try:
+                resp = requests.get(api_endpoint, headers=headers, timeout=30, cookies=cookies)
+                resp.raise_for_status()
+                raw_data = resp.json()
+                st.sidebar.success(f"✅ Status: {resp.status_code}")
+                st.sidebar.json(raw_data)
+            except Exception as e:
+                st.sidebar.error(f"❌ Error: {str(e)}")
+        elif fetch_btn:
+            # Fetch: process and store links
             if api_endpoint:
                 with st.spinner("Fetching items via API..."):
                     links = fetch_items_api(api_endpoint, authorization_header, cookie_header)
@@ -416,35 +448,6 @@ def run_app():
             else:
                 st.session_state["lean_fetched_links"] = links
                 st.sidebar.success(f"Found {len(links)} links (showing first 50).")
-    
-    with col2:
-        if st.button("🐛 Debug API"):
-            # Show raw API response for debugging
-            if not api_endpoint:
-                st.sidebar.error("Provide an API endpoint first.")
-            else:
-                with st.spinner("Fetching raw API response..."):
-                    headers = {"User-Agent": "agile-biofoundry-bot/1.0"}
-                    if authorization_header:
-                        if authorization_header.lower().startswith("bearer ") or ":" in authorization_header or authorization_header.count(" ") > 0:
-                            headers["Authorization"] = authorization_header
-                        else:
-                            headers["Authorization"] = f"Bearer {authorization_header}"
-                    cookies = None
-                    if cookie_header:
-                        cookies = {}
-                        for part in [p.strip() for p in cookie_header.split(";") if p.strip()]:
-                            if "=" in part:
-                                k, v = part.split("=", 1)
-                                cookies[k.strip()] = v.strip()
-                    try:
-                        resp = requests.get(api_endpoint, headers=headers, timeout=30, cookies=cookies)
-                        resp.raise_for_status()
-                        raw_data = resp.json()
-                        st.sidebar.info(f"✅ Status: {resp.status_code}")
-                        st.sidebar.json(raw_data)
-                    except Exception as e:
-                        st.sidebar.error(f"❌ Error: {str(e)}")
     
         if not lean_page:
             st.sidebar.error("Provide a Lean Library page URL first.")
