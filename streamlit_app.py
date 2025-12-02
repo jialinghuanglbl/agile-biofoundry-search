@@ -7,8 +7,10 @@ from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from PyPDF2 import PdfReader
 
 # Local article storage
 DATA_DIR = Path("data")
@@ -113,6 +115,86 @@ def fetch_and_extract_html(url: str) -> str:
     joined = "\n\n".join(ps)
     return joined
 
+
+def download_file(url: str, dest: Path) -> bool:
+    try:
+        r = requests.get(url, stream=True, timeout=30, headers={"User-Agent": "agile-biofoundry-bot/1.0"})
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(1024 * 64):
+                f.write(chunk)
+        return True
+    except Exception:
+        return False
+
+
+def fetch_lean_library_links(page_url: str, cookie_header: str | None = None, limit: int = 200) -> list:
+    """Fetch a Lean Library page and heuristically extract candidate article links.
+
+    - `cookie_header` can be a raw cookie string like "name=value; name2=value2" to access pages behind simple auth.
+    - Returns a list of dicts: {"url": <absolute url>, "title": <link text or None>}.
+    """
+    try:
+        headers = {"User-Agent": "agile-biofoundry-bot/1.0"}
+        cookies = None
+        if cookie_header:
+            cookies = {}
+            for part in [p.strip() for p in cookie_header.split(";") if p.strip()]:
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    cookies[k.strip()] = v.strip()
+
+        resp = requests.get(page_url, headers=headers, timeout=20, cookies=cookies)
+        resp.raise_for_status()
+        try:
+            soup = BeautifulSoup(resp.content, "lxml")
+        except Exception:
+            soup = BeautifulSoup(resp.content, "html.parser")
+    except Exception:
+        return []
+
+    anchors = soup.find_all("a", href=True)
+    results = []
+    seen = set()
+    for a in anchors:
+        href = a.get("href")
+        if not href:
+            continue
+        href = urljoin(page_url, href)
+        # only keep http(s)
+        if not (href.startswith("http://") or href.startswith("https://")):
+            continue
+        # skip obvious anchors or same-page fragments
+        if href in seen or href.startswith(page_url + "#"):
+            continue
+        # simple noise filtering: ignore links to css/js/images and mailto/tel
+        if any(x in href for x in (".css", ".js", ".jpg", ".jpeg", ".png", ".svg", "mailto:", "tel:")):
+            continue
+
+        title = a.get_text(strip=True) or None
+        results.append({"url": href, "title": title})
+        seen.add(href)
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def extract_text_from_pdf(path: Path) -> str:
+    try:
+        reader = PdfReader(str(path))
+        texts = []
+        for p in reader.pages:
+            try:
+                t = p.extract_text() or ""
+            except Exception:
+                t = ""
+            if t:
+                texts.append(t)
+        return "\n\n".join(texts)
+    except Exception:
+        return ""
+
 def build_tfidf_index(articles):
     """Build a TF-IDF index from articles."""
     if not articles:
@@ -202,27 +284,29 @@ def run_app():
     st.set_page_config(page_title="Agile Biofoundry Search", layout="wide")
     st.title("Agile Biofoundry — Article Search & Analysis")
 
-    # Sidebar: Add article form
-    st.sidebar.header("Add Article")
-    with st.sidebar.form("add_article_form"):
-        title = st.text_input("Title *", key="article_title")
-        authors = st.text_input("Authors (comma-separated)", key="article_authors")
-        abstract = st.text_area("Abstract / Summary", key="article_abstract")
-        url = st.text_input("URL / DOI", key="article_url")
-        full_text = st.text_area("Full Text (optional)", height=150, key="article_text")
-        
-        submit = st.form_submit_button("Add Article", type="primary")
-        if submit:
-            if not title:
-                st.sidebar.error("Title is required.")
-            else:
-                author_list = [a.strip() for a in authors.split(",") if a.strip()] if authors else []
-                text = (full_text or abstract or "").strip()
-                add_article(title, author_list, abstract, url, text)
-                st.sidebar.success("Article added!")
-                st.rerun()
+    # Sidebar note: articles are managed by imports and crawls (no manual add)
+    st.sidebar.header("Library Import / Sync")
+    st.sidebar.info("Articles are added automatically via Lean Library import or page fetch. Use the Import or Fetch options below to populate the library. You can view/delete items under Manage Articles.")
 
     # Load articles
+    st.sidebar.markdown("---")
+    st.sidebar.header("Import Lean Library export")
+    upload_file = st.sidebar.file_uploader("Upload JSON (array of articles) or CSV with a 'url' column", type=["json", "csv"], key="lean_upload")
+    st.sidebar.markdown("---")
+    st.sidebar.header("Or: fetch from a Lean Library page")
+    lean_page = st.sidebar.text_input("Lean Library page URL", placeholder="https://your-institution.leanlibrary.org/collections/xxxx", key="lean_page_url")
+    cookie_header = st.sidebar.text_area("Optional: Cookie header (for authenticated pages)", help="Paste cookie string like `name=value; name2=value2` if needed to access your Lean Library page.", key="lean_cookie")
+    if st.sidebar.button("Fetch links from page"):
+        if not lean_page:
+            st.sidebar.error("Provide a Lean Library page URL first.")
+        else:
+            with st.sidebar.spinner("Fetching links from Lean Library page..."):
+                links = fetch_lean_library_links(lean_page, cookie_header)
+            if not links:
+                st.sidebar.warning("No candidate links found or failed to fetch the page. Check URL / cookies.")
+            else:
+                st.session_state["lean_fetched_links"] = links
+                st.sidebar.success(f"Found {len(links)} links (showing first 50).")
     articles = load_articles()
     
     # Main area: Search and analysis
@@ -232,8 +316,30 @@ def run_app():
         st.info("No articles yet. Add articles from the sidebar to get started.")
         return
 
+    if upload_file is not None:
+        # read file
+        raw = upload_file.read()
+    # If we fetched links from the Lean page, show them and allow importing
+    fetched = st.session_state.get("lean_fetched_links") if hasattr(st, "session_state") else None
+    if fetched:
+        st.divider()
+        st.subheader("Links found on Lean Library page")
+        max_preview = min(50, len(fetched))
+        selected = []
+        for i, item in enumerate(fetched[:max_preview]):
+            st.write(f"{i+1}. {item.get('title') or item['url']}")
+            st.write(f"`{item['url']}`")
     # Display article count
     st.metric("Articles in library", len(articles))
+
+    # Show last import log if available
+    import_log = st.session_state.get("lean_import_log") if hasattr(st, "session_state") else None
+    if import_log:
+        st.divider()
+        st.subheader("Last import log")
+        with st.expander("View import log", expanded=False):
+            for line in import_log:
+                st.write(line)
 
     # Search bar and settings
     col1, col2 = st.columns([3, 1])

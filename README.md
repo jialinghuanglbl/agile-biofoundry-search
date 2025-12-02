@@ -1,50 +1,5 @@
 # Agile Biofoundry — Article Search & Analysis
 
-A Streamlit app for building a custom article library and running AI-powered analysis on search results.
-
-## Features
-
-- **Manual Article Upload**: Add articles with title, authors, abstract, URL, and full text via a sidebar form
-- **Local Storage**: Articles persist in `data/articles.json`
-- **TF-IDF Search**: Fast keyword/semantic search across articles
-- **AI Analysis**: Get ChatGPT-powered summaries and insights from OpenAI API
-- **Article Management**: View, expand, and delete articles from the sidebar
-
-## Setup
-
-### 1. Install Dependencies
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-### 2. Configure OpenAI API (Optional but Recommended)
-
-To enable AI analysis, provide your OpenAI API key. Choose one:
-
-**Option A: Environment Variable** (recommended for deployment)
-```bash
-export OPENAI_API_KEY="sk-..."
-```
-
-**Option B: Streamlit Secrets** (local development)
-Create `.streamlit/secrets.toml`:
-```toml
-openai_api_key = "sk-..."
-```
-
-### 3. Run the App
-
-```bash
-streamlit run streamlit_app.py
-```
-
-The app will open at `http://localhost:8501`.
-
-## Usage
-
-### Add Articles
-
 1. Open the sidebar **Add Article** form
 2. Fill in:
    - **Title** (required)
@@ -98,36 +53,3 @@ You can edit `data/articles.json` directly to bulk import articles or migrate da
 2. Article text is concatenated and sent to OpenAI's `gpt-4o-mini` model
 3. Model generates analysis answering your query based on the articles
 4. Response displayed in the app (typically 500–1500 characters)
-
-**Cost**: Each analysis call costs ~$0.01–$0.05 depending on article length (see [OpenAI pricing](https://openai.com/pricing)).
-
-## Deployment
-
-### Local
-```bash
-streamlit run streamlit_app.py
-```
-
-### Docker
-```bash
-docker build -t agile-biofoundry .
-docker run -p 8501:8501 -e OPENAI_API_KEY="sk-..." agile-biofoundry
-```
-
-### Streamlit Cloud
-1. Push repo to GitHub
-2. Deploy at [streamlit.io/cloud](https://share.streamlit.io)
-3. Add `OPENAI_API_KEY` secret in app settings
-
-## Troubleshooting
-
-**"OpenAI API key not configured"**
-- Set `OPENAI_API_KEY` env var or add to `.streamlit/secrets.toml`
-- Ensure the key is valid (starts with `sk-`)
-
-**"No matching articles found"**
-- Add more articles with substantive text/abstracts
-- Try simpler queries (fewer words, common terms)
-
-**App is slow**
-- TF-IDF is computed on each search; for >1000 articles, consider caching the vectorizer to `.streamlit/cache_resources`
