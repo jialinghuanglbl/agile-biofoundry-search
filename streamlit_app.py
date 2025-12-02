@@ -196,20 +196,22 @@ def fetch_lean_library_links(page_url: str, cookie_header: str | None = None, li
     return results
 
 
-def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_header: str | None = None, query_params: str | None = None) -> list:
+def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_header: str | None = None, query_params: str | None = None, collection_id: str | None = None) -> list:
     """Call a JSON API endpoint (the SPA XHR 'items' endpoint) and return a list of {url,title} dicts.
 
-    - `authorization` (optional) — full header value (e.g. 'Bearer <token>') or token string.
+    - Uses POST with JSON body (Sciwheel-style endpoint).
+    - `collection_id` — the collection ID to filter by (e.g., "1054271").
+    - `authorization` (optional) — full header value or token string.
     - `cookie_header` (optional) — cookie string "name1=value1; name2=value2".
-    - `query_params` (optional) — query string like "collectionId=1054271&limit=100".
+    - `query_params` (deprecated, kept for compatibility).
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/json;charset=UTF-8",
         "Referer": endpoint,
     }
     if authorization:
-        # allow either full 'Bearer ...' or bare token
         if authorization.lower().startswith("bearer ") or ":" in authorization or authorization.count(" ") > 0:
             headers["Authorization"] = authorization
         else:
@@ -223,14 +225,32 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
                 k, v = part.split("=", 1)
                 cookies[k.strip()] = v.strip()
 
-    # Add query params if provided
-    url = endpoint
-    if query_params:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}{query_params}"
+    # Build POST payload
+    payload = {
+        "libraryItemCriteria": {
+            "collectionId": collection_id or "1054271",
+            "tagIds": None,
+            "withMissingCitationData": None,
+            "fieldsCriteria": [],
+            "withPdf": None,
+            "recommended": None,
+            "withAnnotations": None,
+            "review": None,
+            "clinicalTrial": None,
+            "systematicReview": None,
+            "addedByMe": None,
+            "withoutTags": None,
+        },
+        "query": None,
+        "page": None,
+        "show": 100,  # Increase page size
+        "sortBy": ["addedDate"],
+        "sortingOrder": None,
+        "hasTextParams": False,
+    }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=30, cookies=cookies)
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=30, cookies=cookies)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -239,12 +259,11 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
     # Normalize data to a list of items
     items = []
     if isinstance(data, dict):
-        for key in ("items", "results", "data", "articles", "content"):
+        for key in ("items", "results", "data", "articles", "content", "libraryItems"):
             if key in data and isinstance(data[key], list):
                 items = data[key]
                 break
         if not items:
-            # maybe the dict itself is one item
             if any(k in data for k in ("id", "title", "url")):
                 items = [data]
     elif isinstance(data, list):
@@ -255,8 +274,8 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
     for a in items:
         if not isinstance(a, dict):
             continue
-        url = a.get("url") or a.get("link") or a.get("pdf_url") or a.get("pdf") or a.get("file") or a.get("uri")
-        title = a.get("title") or a.get("name") or a.get("article_title") or None
+        url = a.get("url") or a.get("link") or a.get("pdf_url") or a.get("pdf") or a.get("file") or a.get("uri") or a.get("pdfUrl")
+        title = a.get("title") or a.get("name") or a.get("article_title") or a.get("articleTitle") or None
         if not url:
             continue
         if url in seen:
@@ -385,10 +404,10 @@ def run_app():
     # API endpoint / Authorization support (preferred for SPA)
     st.sidebar.markdown("---")
     st.sidebar.header("Optional: Use site API / XHR endpoint")
-    st.sidebar.info("Paste the 'items' XHR endpoint URL. Auth is typically via cookies (session-based). If items need filtering, add query params like `?collectionId=1054271`.")
+    st.sidebar.info("Paste the 'items' XHR endpoint URL. This is a POST endpoint that uses your cookies for auth.")
     api_endpoint = st.sidebar.text_input("API endpoint (paste XHR 'items' URL)", placeholder="https://sciwheel.com/work/api/search/items", key="lean_api_endpoint")
-    query_params = st.sidebar.text_input("Query parameters (optional)", placeholder="collectionId=1054271&limit=100", key="lean_query_params")
-    authorization_header = st.sidebar.text_input("Authorization header (optional, usually not needed)", placeholder="Bearer <token> or token", key="lean_api_auth")
+    collection_id = st.sidebar.text_input("Collection ID (optional)", placeholder="1054271", key="lean_collection_id")
+    authorization_header = st.sidebar.text_input("Authorization header (usually not needed)", placeholder="Bearer <token> or token", key="lean_api_auth")
 
     with st.sidebar.expander("ℹ️ How to get the XHR token", expanded=False):
         st.markdown("""
@@ -456,7 +475,7 @@ def run_app():
         elif debug_btn:
             # Debug: show raw API response
             st.sidebar.info("Fetching raw API response...")
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json", "Content-Type": "application/json;charset=UTF-8"}
             if authorization_header:
                 if authorization_header.lower().startswith("bearer ") or ":" in authorization_header or authorization_header.count(" ") > 0:
                     headers["Authorization"] = authorization_header
@@ -470,20 +489,39 @@ def run_app():
                         k, v = part.split("=", 1)
                         cookies[k.strip()] = v.strip()
             
-            # Build URL with query params
-            url = api_endpoint
-            if query_params:
-                sep = "&" if "?" in url else "?"
-                url = f"{url}{sep}{query_params}"
+            # Build POST payload (same as fetch_items_api)
+            payload = {
+                "libraryItemCriteria": {
+                    "collectionId": collection_id or "1054271",
+                    "tagIds": None,
+                    "withMissingCitationData": None,
+                    "fieldsCriteria": [],
+                    "withPdf": None,
+                    "recommended": None,
+                    "withAnnotations": None,
+                    "review": None,
+                    "clinicalTrial": None,
+                    "systematicReview": None,
+                    "addedByMe": None,
+                    "withoutTags": None,
+                },
+                "query": None,
+                "page": None,
+                "show": 100,
+                "sortBy": ["addedDate"],
+                "sortingOrder": None,
+                "hasTextParams": False,
+            }
             
             # Show what we're sending
             st.sidebar.write("**Request details:**")
-            st.sidebar.write(f"URL: `{url}`")
-            st.sidebar.write(f"Auth header: `{headers.get('Authorization', '(none)')}`")
+            st.sidebar.write(f"URL: `{api_endpoint}`")
+            st.sidebar.write(f"Method: POST")
+            st.sidebar.write(f"Collection ID: `{collection_id or '(default)'}`")
             st.sidebar.write(f"Cookies: `{len(cookies) if cookies else 0} cookies`")
             
             try:
-                resp = requests.get(url, headers=headers, timeout=30, cookies=cookies)
+                resp = requests.post(api_endpoint, json=payload, headers=headers, timeout=30, cookies=cookies)
                 st.sidebar.write(f"**Response status:** {resp.status_code}")
                 resp.raise_for_status()
                 raw_data = resp.json()
@@ -492,11 +530,10 @@ def run_app():
             except requests.exceptions.HTTPError as e:
                 st.sidebar.error(f"❌ HTTP Error {e.response.status_code}: {e.response.reason}")
                 st.sidebar.write("**Tips:**")
-                st.sidebar.write("- For 401/403: Cookies may have expired. Re-copy from DevTools → Application → Cookies.")
-                st.sidebar.write("- Try adding query params like `collectionId=1054271` (the collection ID from your URL).")
-                st.sidebar.write("- The endpoint may require different query param names. Check DevTools Network tab for the actual XHR request URL parameters.")
+                st.sidebar.write("- For 401/403: Cookies may have expired. Re-copy from DevTools.")
+                st.sidebar.write("- For 500: Check if the collection ID is correct and the endpoint is right.")
                 try:
-                    st.sidebar.write(f"Response body: {e.response.text[:200]}")
+                    st.sidebar.write(f"Response body: {e.response.text[:300]}")
                 except:
                     pass
             except Exception as e:
@@ -505,7 +542,7 @@ def run_app():
             # Fetch: process and store links
             if api_endpoint:
                 with st.spinner("Fetching items via API..."):
-                    links = fetch_items_api(api_endpoint, authorization_header, cookie_header, query_params)
+                    links = fetch_items_api(api_endpoint, authorization_header, cookie_header, collection_id=collection_id)
             else:
                 with st.spinner("Fetching links from Lean Library page..."):
                     links = fetch_lean_library_links(lean_page, cookie_header)
