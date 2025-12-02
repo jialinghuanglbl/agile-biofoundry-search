@@ -401,14 +401,36 @@ def run_app():
 
     with st.sidebar.expander("ℹ️ How to get authentication cookies", expanded=False):
         st.markdown("""
-**If you prefer cookies:**
+**Quick copy-paste method:**
 1. Open your Lean Library project in a browser (logged in)
-2. Open Developer Tools → Application → Cookies
-3. Copy cookie string format: `name1=value1; name2=value2`
-4. Paste into the Cookie header field below
+2. Open Developer Tools → **Application** → **Cookies** → **sciwheel.com**
+3. Select all cookies (Ctrl+A in the table), copy them
+4. Paste into the text area below — the app will auto-format
+5. Or manually copy key cookie names like `JSESSIONID`, `SPRING_SECURITY_REMEMBER_ME_COOKIE`, etc.
 """)
 
-    cookie_header = st.sidebar.text_area("Cookie header (for authenticated pages)", help="Paste cookie string like `name=value; name2=value2` if needed to access your Lean Library page.", key="lean_cookie")
+    cookie_input = st.sidebar.text_area(
+        "Paste cookies here (will auto-format)",
+        height=100,
+        placeholder="Paste raw cookies from DevTools. Format: name=value or multi-line list",
+        key="lean_cookie_input"
+    )
+    
+    # Auto-format cookies: handle both "name=value" and multi-line formats
+    def parse_cookies(raw_input):
+        if not raw_input:
+            return ""
+        # Try to clean up and reformat
+        lines = raw_input.strip().split("\n")
+        pairs = []
+        for line in lines:
+            line = line.strip()
+            if "=" in line and not any(x in line for x in ["http", "curl", "name", "domain", "path", "secure"]):
+                # Looks like a name=value pair
+                pairs.append(line)
+        return "; ".join(pairs)
+    
+    cookie_header = parse_cookies(cookie_input)
     
     # Buttons: Fetch and Debug
     col1, col2, col3 = st.sidebar.columns(3)
