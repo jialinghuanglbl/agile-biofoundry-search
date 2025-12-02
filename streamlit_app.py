@@ -312,15 +312,17 @@ def run_app():
     # Main area: Search and analysis
     st.header("Search & Analysis")
     
-    if not articles:
-        st.info("No articles yet. Add articles from the sidebar to get started.")
+    # Check if we have fetched links to display/import
+    fetched = st.session_state.get("lean_fetched_links") if hasattr(st, "session_state") else None
+    
+    # Only return early if we have no articles AND no fetched links
+    if not articles and not fetched:
+        st.info("No articles yet. Fetch links from a Lean Library page or upload an export to get started.")
         return
 
     if upload_file is not None:
         # read file
         raw = upload_file.read()
-    # If we fetched links from the Lean page, show them and allow importing
-    fetched = st.session_state.get("lean_fetched_links") if hasattr(st, "session_state") else None
     if fetched:
         st.divider()
         st.subheader("Links found on Lean Library page")
@@ -332,7 +334,7 @@ def run_app():
             st.write(f"`{item['url']}`")
         
         # Add import button
-        if st.button("📥 Import all links and extract content"):
+        if st.button("Import all links and extract content"):
             articles = load_articles()
             existing_urls = {a.get("url") for a in articles}
             progress_bar = st.progress(0)
