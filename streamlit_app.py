@@ -196,6 +196,68 @@ def fetch_lean_library_links(page_url: str, cookie_header: str | None = None, li
     return results
 
 
+def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_header: str | None = None) -> list:
+    """Call a JSON API endpoint (the SPA XHR 'items' endpoint) and return a list of {url,title} dicts.
+
+    - `authorization` should be the full header value (e.g. 'Bearer <token>') or token string.
+    - `cookie_header` can supply cookies if needed.
+    """
+    headers = {
+        "User-Agent": "agile-biofoundry-bot/1.0",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+    if authorization:
+        # allow either full 'Bearer ...' or bare token
+        if authorization.lower().startswith("bearer ") or ":" in authorization or authorization.count(" ") > 0:
+            headers["Authorization"] = authorization
+        else:
+            headers["Authorization"] = f"Bearer {authorization}"
+
+    cookies = None
+    if cookie_header:
+        cookies = {}
+        for part in [p.strip() for p in cookie_header.split(";") if p.strip()]:
+            if "=" in part:
+                k, v = part.split("=", 1)
+                cookies[k.strip()] = v.strip()
+
+    try:
+        resp = requests.get(endpoint, headers=headers, timeout=30, cookies=cookies)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return [{"url": endpoint, "title": f"❌ API fetch error: {str(e)[:120]}"}]
+
+    # Normalize data to a list of items
+    items = []
+    if isinstance(data, dict):
+        for key in ("items", "results", "data", "articles"):
+            if key in data and isinstance(data[key], list):
+                items = data[key]
+                break
+        if not items:
+            # maybe the dict itself is one item
+            if any(k in data for k in ("id", "title", "url")):
+                items = [data]
+    elif isinstance(data, list):
+        items = data
+
+    results = []
+    seen = set()
+    for a in items:
+        if not isinstance(a, dict):
+            continue
+        url = a.get("url") or a.get("link") or a.get("pdf_url") or a.get("pdf")
+        title = a.get("title") or a.get("name") or None
+        if not url:
+            continue
+        if url in seen:
+            continue
+        results.append({"url": url, "title": title})
+        seen.add(url)
+    return results
+
+
 def extract_text_from_pdf(path: Path) -> str:
     try:
         reader = PdfReader(str(path))
@@ -311,22 +373,47 @@ def run_app():
     st.sidebar.markdown("---")
     st.sidebar.header("Or: fetch from a Lean Library page")
     lean_page = st.sidebar.text_input("Lean Library page URL", placeholder="https://your-institution.leanlibrary.org/collections/xxxx", key="lean_page_url")
-    
+
+    # API endpoint / Authorization support (preferred for SPA)
+    st.sidebar.markdown("---")
+    st.sidebar.header("Optional: Use site API / XHR endpoint")
+    st.sidebar.info("If you see an XHR 'items' request in DevTools, paste its full request URL here and an Authorization token (if present). This is the most reliable method for private projects.")
+    api_endpoint = st.sidebar.text_input("API endpoint (paste XHR 'items' URL)", placeholder="https://sciwheel.com/api/.../items", key="lean_api_endpoint")
+    authorization_header = st.sidebar.text_input("Authorization header (optional)", placeholder="Bearer <token> or token", key="lean_api_auth")
+
+    with st.sidebar.expander("ℹ️ How to get the XHR token", expanded=False):
+        st.markdown("""
+1. Open your project page in the browser while logged in.
+2. Open DevTools → Network → filter XHR/Fetch and reload.
+3. Find the `items` XHR request, right-click → Copy → Copy request URL.
+4. In the XHR request headers look for `Authorization`, or check Application → Local Storage for `accessToken`/`authToken`.
+5. Paste the request URL into "API endpoint" and paste the header value into "Authorization header".
+""")
+
     with st.sidebar.expander("ℹ️ How to get authentication cookies", expanded=False):
         st.markdown("""
-**For private Lean Library pages:**
+**If you prefer cookies:**
 1. Open your Lean Library project in a browser (logged in)
-2. Open **Developer Tools** (F12 or right-click → Inspect)
-3. Go to **Application** tab → **Cookies**
-4. Find cookies related to Lean Library (often `session`, `auth`, or similar)
-5. Copy the cookie string format: `name1=value1; name2=value2; name3=value3`
-6. Paste it below in the "Cookie header" field
-
-**Common cookie sources:** Session tokens, auth tokens, or institutional SSO cookies.
+2. Open Developer Tools → Application → Cookies
+3. Copy cookie string format: `name1=value1; name2=value2`
+4. Paste into the Cookie header field below
 """)
-    
+
     cookie_header = st.sidebar.text_area("Cookie header (for authenticated pages)", help="Paste cookie string like `name=value; name2=value2` if needed to access your Lean Library page.", key="lean_cookie")
     if st.sidebar.button("Fetch links from page"):
+        # Prefer API endpoint if provided
+        if api_endpoint:
+            with st.spinner("Fetching items via API..."):
+                links = fetch_items_api(api_endpoint, authorization_header, cookie_header)
+        else:
+            with st.spinner("Fetching links from Lean Library page..."):
+                links = fetch_lean_library_links(lean_page, cookie_header)
+        if not links:
+            st.sidebar.warning("No candidate links found or failed to fetch the page. Check URL / cookies / auth token.")
+        else:
+            st.session_state["lean_fetched_links"] = links
+            st.sidebar.success(f"Found {len(links)} links (showing first 50).")
+    
         if not lean_page:
             st.sidebar.error("Provide a Lean Library page URL first.")
         else:
