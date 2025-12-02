@@ -325,10 +325,91 @@ def run_app():
         st.divider()
         st.subheader("Links found on Lean Library page")
         max_preview = min(50, len(fetched))
-        selected = []
+        
+        # Show fetched links
         for i, item in enumerate(fetched[:max_preview]):
             st.write(f"{i+1}. {item.get('title') or item['url']}")
             st.write(f"`{item['url']}`")
+        
+        # Add import button
+        if st.button("📥 Import all links and extract content"):
+            articles = load_articles()
+            existing_urls = {a.get("url") for a in articles}
+            progress_bar = st.progress(0)
+            status_container = st.empty()
+            logs = []
+            imported = 0
+            total = len(fetched)
+            
+            for i, item in enumerate(fetched):
+                url = item.get("url")
+                title = item.get("title") or url
+                
+                # Update progress and status
+                progress_pct = int((i + 1) / total * 100)
+                progress_bar.progress(progress_pct)
+                status_container.write(f"Processing {i+1}/{total}...")
+                
+                if not url or url in existing_urls:
+                    logs.append(f"⏭ {i+1}/{total}: Skipped (duplicate or no URL)")
+                    continue
+                
+                # Try HTML extraction first
+                text = ""
+                extracted = fetch_and_extract_html(url)
+                if extracted and len(extracted) > 200:
+                    text = extracted
+                    logs.append(f"✅ {i+1}/{total}: Extracted HTML ({len(text)} chars)")
+                else:
+                    # Try PDF
+                    is_pdf = url.lower().endswith(".pdf")
+                    if not is_pdf:
+                        try:
+                            head = requests.head(url, headers={"User-Agent": "agile-biofoundry-bot/1.0"}, timeout=10, allow_redirects=True)
+                            ctype = head.headers.get("content-type", "")
+                            is_pdf = "pdf" in ctype.lower()
+                        except Exception:
+                            pass
+                    
+                    if is_pdf:
+                        dest = DATA_DIR / (str(uuid.uuid4()) + ".pdf")
+                        if download_file(url, dest):
+                            pdf_text = extract_text_from_pdf(dest)
+                            if pdf_text and len(pdf_text) > 100:
+                                text = pdf_text
+                                logs.append(f"✅ {i+1}/{total}: Extracted PDF ({len(text)} chars)")
+                            else:
+                                logs.append(f"⚠️ {i+1}/{total}: PDF has no extractable text")
+                        else:
+                            logs.append(f"❌ {i+1}/{total}: Failed to download PDF")
+                    else:
+                        if extracted:
+                            logs.append(f"⚠️ {i+1}/{total}: HTML too small ({len(extracted)} chars, need >200)")
+                        else:
+                            logs.append(f"❌ {i+1}/{total}: Failed to extract any content")
+                
+                # Add article
+                new = {
+                    "id": str(uuid.uuid4()),
+                    "title": title,
+                    "authors": [],
+                    "abstract": None,
+                    "url": url,
+                    "text": text,
+                    "created_at": datetime.now().isoformat(),
+                }
+                articles.append(new)
+                existing_urls.add(url)
+                imported += 1
+            
+            # Save and finalize
+            if imported > 0:
+                save_articles(articles)
+            st.session_state["lean_import_log"] = logs
+            progress_bar.progress(100)
+            status_container.success(f"✅ Import complete! Added {imported} articles.")
+            st.rerun()
+    
     # Display article count
     st.metric("Articles in library", len(articles))
 
