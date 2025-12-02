@@ -132,10 +132,16 @@ def fetch_lean_library_links(page_url: str, cookie_header: str | None = None, li
     """Fetch a Lean Library page and heuristically extract candidate article links.
 
     - `cookie_header` can be a raw cookie string like "name=value; name2=value2" to access pages behind simple auth.
+    - Passes all cookies, referer, and User-Agent to mimic a browser for authenticated pages.
     - Returns a list of dicts: {"url": <absolute url>, "title": <link text or None>}.
     """
     try:
-        headers = {"User-Agent": "agile-biofoundry-bot/1.0"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": page_url,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
         cookies = None
         if cookie_header:
             cookies = {}
@@ -144,14 +150,24 @@ def fetch_lean_library_links(page_url: str, cookie_header: str | None = None, li
                     k, v = part.split("=", 1)
                     cookies[k.strip()] = v.strip()
 
-        resp = requests.get(page_url, headers=headers, timeout=20, cookies=cookies)
+        # Use session to persist cookies and headers
+        session = requests.Session()
+        if cookies:
+            session.cookies.update(cookies)
+        
+        resp = session.get(page_url, headers=headers, timeout=20, allow_redirects=True)
         resp.raise_for_status()
+        
+        # Check if we got redirected to login (common pattern)
+        if "login" in resp.url.lower() or "signin" in resp.url.lower():
+            return [{"url": page_url, "title": "⚠️ Page requires authentication—provide valid cookies"}]
+        
         try:
             soup = BeautifulSoup(resp.content, "lxml")
         except Exception:
             soup = BeautifulSoup(resp.content, "html.parser")
-    except Exception:
-        return []
+    except Exception as e:
+        return [{"url": page_url, "title": f"❌ Error fetching page: {str(e)[:60]}"}]
 
     anchors = soup.find_all("a", href=True)
     results = []
@@ -295,7 +311,21 @@ def run_app():
     st.sidebar.markdown("---")
     st.sidebar.header("Or: fetch from a Lean Library page")
     lean_page = st.sidebar.text_input("Lean Library page URL", placeholder="https://your-institution.leanlibrary.org/collections/xxxx", key="lean_page_url")
-    cookie_header = st.sidebar.text_area("Optional: Cookie header (for authenticated pages)", help="Paste cookie string like `name=value; name2=value2` if needed to access your Lean Library page.", key="lean_cookie")
+    
+    with st.sidebar.expander("ℹ️ How to get authentication cookies", expanded=False):
+        st.markdown("""
+**For private Lean Library pages:**
+1. Open your Lean Library project in a browser (logged in)
+2. Open **Developer Tools** (F12 or right-click → Inspect)
+3. Go to **Application** tab → **Cookies**
+4. Find cookies related to Lean Library (often `session`, `auth`, or similar)
+5. Copy the cookie string format: `name1=value1; name2=value2; name3=value3`
+6. Paste it below in the "Cookie header" field
+
+**Common cookie sources:** Session tokens, auth tokens, or institutional SSO cookies.
+""")
+    
+    cookie_header = st.sidebar.text_area("Cookie header (for authenticated pages)", help="Paste cookie string like `name=value; name2=value2` if needed to access your Lean Library page.", key="lean_cookie")
     if st.sidebar.button("Fetch links from page"):
         if not lean_page:
             st.sidebar.error("Provide a Lean Library page URL first.")
