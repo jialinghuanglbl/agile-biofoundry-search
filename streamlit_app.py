@@ -300,7 +300,7 @@ def run_app():
         if not lean_page:
             st.sidebar.error("Provide a Lean Library page URL first.")
         else:
-            with st.sidebar.spinner("Fetching links from Lean Library page..."):
+            with st.spinner("Fetching links from Lean Library page..."):
                 links = fetch_lean_library_links(lean_page, cookie_header)
             if not links:
                 st.sidebar.warning("No candidate links found or failed to fetch the page. Check URL / cookies.")
