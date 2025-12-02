@@ -259,7 +259,8 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
     # Normalize data to a list of items
     items = []
     if isinstance(data, dict):
-        for key in ("items", "results", "data", "articles", "content", "libraryItems"):
+        # Check for Sciwheel API response key first ("displayedItems")
+        for key in ("displayedItems", "items", "results", "data", "articles", "content", "libraryItems"):
             if key in data and isinstance(data[key], list):
                 items = data[key]
                 break
@@ -274,8 +275,9 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
     for a in items:
         if not isinstance(a, dict):
             continue
-        url = a.get("url") or a.get("link") or a.get("pdf_url") or a.get("pdf") or a.get("file") or a.get("uri") or a.get("pdfUrl")
-        title = a.get("title") or a.get("name") or a.get("article_title") or a.get("articleTitle") or None
+        # Sciwheel uses "fullTextLink" as the primary article URL field
+        url = a.get("fullTextLink") or a.get("url") or a.get("link") or a.get("pdf_url") or a.get("pdf") or a.get("file") or a.get("uri") or a.get("pdfUrl")
+        title = a.get("title") or a.get("plainTitle") or a.get("name") or a.get("article_title") or a.get("articleTitle") or None
         if not url:
             continue
         if url in seen:
