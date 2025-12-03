@@ -8,6 +8,8 @@ from pathlib import Path
 from datetime import datetime
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import gc
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -21,6 +23,19 @@ ARTICLES_PATH = DATA_DIR / "articles.json"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 # Maximum text stored per article (truncate very large PDFs/HTML to avoid OOM)
 MAX_ARTICLE_TEXT = 200_000
+# Limits for downloads
+MAX_DOWNLOAD_BYTES = 5_000_000  # 5 MB for HTML fetch buffer
+MAX_PDF_BYTES = 50_000_000  # 50 MB maximum PDF download
+RETRY_STRATEGY = Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+
+def build_session(cookies: dict | None = None) -> requests.Session:
+    s = requests.Session()
+    adapter = HTTPAdapter(max_retries=RETRY_STRATEGY)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    if cookies:
+        s.cookies.update(cookies)
+    return s
 
 # Initialize OpenAI client (requires OPENAI_API_KEY env var or st.secrets)
 def get_openai_client():
@@ -36,6 +51,17 @@ def load_articles():
         with open(ARTICLES_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     return []
+
+
+def cookie_header_to_dict(cookie_header: str | None) -> dict | None:
+    if not cookie_header:
+        return None
+    cookies = {}
+    for part in [p.strip() for p in cookie_header.split(";") if p.strip()]:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    return cookies
 
 def save_articles(articles):
     """Save articles to local storage.
@@ -79,7 +105,7 @@ def delete_article(article_id):
     save_articles(articles)
 
 
-def fetch_and_extract_html(url: str) -> str:
+def fetch_and_extract_html(url: str, cookies: dict | None = None) -> str:
     """Fetch a URL and heuristically extract the main article text using BeautifulSoup.
 
     Strategy:
@@ -88,9 +114,28 @@ def fetch_and_extract_html(url: str) -> str:
     - Else extract all <p> text and return the largest contiguous block
     """
     try:
-        resp = requests.get(url, timeout=20, headers={"User-Agent": "agile-biofoundry-bot/1.0"})
+        s = build_session(cookies)
+        headers = {"User-Agent": "agile-biofoundry-bot/1.0", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+        resp = s.get(url, timeout=20, headers=headers, stream=True, allow_redirects=True)
         resp.raise_for_status()
-        html = resp.content
+        ctype = resp.headers.get("content-type", "")
+        if "pdf" in ctype.lower():
+            return ""
+
+        # Read up to MAX_DOWNLOAD_BYTES bytes to avoid huge downloads
+        collected = bytearray()
+        total = 0
+        for chunk in resp.iter_content(8192):
+            if not chunk:
+                break
+            collected.extend(chunk)
+            total += len(chunk)
+            if total >= MAX_DOWNLOAD_BYTES:
+                break
+        try:
+            html = bytes(collected)
+        except Exception:
+            return ""
     except Exception:
         return ""
 
@@ -135,13 +180,22 @@ def fetch_and_extract_html(url: str) -> str:
     return joined
 
 
-def download_file(url: str, dest: Path) -> bool:
+def download_file(url: str, dest: Path, cookies: dict | None = None) -> bool:
+    s = build_session(cookies)
+    headers = {"User-Agent": "agile-biofoundry-bot/1.0"}
     try:
-        r = requests.get(url, stream=True, timeout=30, headers={"User-Agent": "agile-biofoundry-bot/1.0"})
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(1024 * 64):
-                f.write(chunk)
+        with s.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True) as r:
+            r.raise_for_status()
+            total = 0
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(1024 * 64):
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    total += len(chunk)
+                    if total >= MAX_PDF_BYTES:
+                        # Too large; abort
+                        raise Exception("File exceeds max allowed size")
         return True
     except Exception:
         # Remove partially-written file if present
@@ -488,7 +542,7 @@ def run_app():
     collection_id = st.sidebar.text_input("Collection ID (optional)", placeholder="1054271", key="lean_collection_id")
     authorization_header = st.sidebar.text_input("Authorization header (usually not needed)", placeholder="Bearer <token> or token", key="lean_api_auth")
 
-    with st.sidebar.expander("ℹ️ How to get the XHR token", expanded=False):
+    with st.sidebar.expander("How to get the XHR token", expanded=False):
         st.markdown("""
 1. Open your project page in the browser while logged in.
 2. Open DevTools → Network → filter XHR/Fetch and reload.
@@ -497,7 +551,7 @@ def run_app():
 5. Paste the request URL into "API endpoint" and paste the header value into "Authorization header".
 """)
 
-    with st.sidebar.expander("ℹ️ How to get authentication cookies", expanded=False):
+    with st.sidebar.expander("How to get authentication cookies", expanded=False):
         st.markdown("""
 **Quick copy-paste method:**
 1. Open your Lean Library project in a browser (logged in)
@@ -513,6 +567,23 @@ def run_app():
         placeholder="Paste raw cookies from DevTools. Format: name=value or multi-line list",
         key="lean_cookie_input"
     )
+
+    # Validate cookies button
+    if st.sidebar.button("Validate cookies", key="btn_validate_cookies"):
+        if not cookie_input:
+            st.sidebar.error("No cookies provided. Paste cookies from DevTools first.")
+        else:
+            cookies_check = cookie_header_to_dict(parse_cookies(cookie_input)) if 'parse_cookies' in globals() else cookie_header_to_dict(cookie_input)
+            s = build_session(cookies_check)
+            try:
+                check_url = api_endpoint or "https://sciwheel.com/work/"
+                resp = s.get(check_url, timeout=15, headers={"User-Agent": "agile-biofoundry-bot/1.0"}, allow_redirects=True)
+                if resp.status_code == 200 and "login" not in resp.url.lower():
+                    st.sidebar.success(f"✅ Cookies look valid (status {resp.status_code})")
+                else:
+                    st.sidebar.warning(f"⚠️ Cookies may be invalid or session expired (status {resp.status_code}, redirected to {resp.url})")
+            except Exception as e:
+                st.sidebar.error(f"❌ Cookie validation failed: {str(e)[:200]}")
     
     # Auto-format cookies: handle both "name=value" and multi-line formats
     def parse_cookies(raw_input):
@@ -544,9 +615,9 @@ def run_app():
     # Buttons: Fetch and Debug
     col1, col2, col3 = st.sidebar.columns(3)
     with col1:
-        fetch_btn = st.button("🔄 Fetch links", key="btn_fetch")
+        fetch_btn = st.button("Fetch links", key="btn_fetch")
     with col2:
-        debug_btn = st.button("🐛 Debug API", key="btn_debug")
+        debug_btn = st.button("Debug API", key="btn_debug")
     
     if fetch_btn or debug_btn:
         if debug_btn and not api_endpoint:
@@ -639,7 +710,7 @@ def run_app():
     
     # Display debug info from parsing if available
     if "parse_debug" in st.session_state and st.session_state["parse_debug"]:
-        with st.expander("🐛 Parse Debug Info (Parser Results)", expanded=False):
+        with st.expander("Parse Debug Info (Parser Results)", expanded=False):
             st.write("**Per-article parsing results:**")
             for line in st.session_state["parse_debug"]:
                 st.write(line)
@@ -665,84 +736,115 @@ def run_app():
             st.write(f"{i+1}. {item.get('title') or item['url']}")
             st.write(f"`{item['url']}`")
         
-        # Add import button
-        if st.button("Import all links and extract content"):
+        # Import controls: batch import to avoid long single runs
+        st.session_state.setdefault("lean_import_pos", 0)
+        import_pos = st.session_state.get("lean_import_pos", 0)
+        total = len(fetched)
+        batch_size = st.number_input("Batch size (items per run)", min_value=1, max_value=max(1, total), value=min(10, total), step=1, key="lean_batch_size")
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            import_batch_btn = st.button("Import next batch and extract content")
+        with col_b:
+            reset_pos = st.button("Reset batch position")
+
+        if reset_pos:
+            st.session_state["lean_import_pos"] = 0
+            st.success("Batch position reset to start.")
+
+        if import_batch_btn:
+            start = import_pos
+            end = min(start + batch_size, total)
+            sublist = fetched[start:end]
+
             articles = load_articles()
             existing_urls = {a.get("url") for a in articles}
             progress_bar = st.progress(0)
             status_container = st.empty()
-            logs = []
+            logs = st.session_state.get("lean_import_log", []) or []
             imported = 0
-            total = len(fetched)
-            
-            for i, item in enumerate(fetched):
+            batch_total = len(sublist)
+
+            for idx, item in enumerate(sublist):
+                global_idx = start + idx + 1
                 url = item.get("url")
                 title = item.get("title") or url
-                
-                # Update progress and status
-                progress_pct = int((i + 1) / total * 100)
+
+                # Update progress and status (relative to batch)
+                progress_pct = int((idx + 1) / max(1, batch_total) * 100)
                 progress_bar.progress(progress_pct)
-                status_container.write(f"Processing {i+1}/{total}...")
-                
+                status_container.write(f"Processing {global_idx}/{total} ({idx+1}/{batch_total} in batch)...")
+
                 if not url or url in existing_urls:
-                    logs.append(f"⏭ {i+1}/{total}: Skipped (duplicate or no URL)")
+                    logs.append(f"⏭ {global_idx}/{total}: Skipped (duplicate or no URL)")
                     continue
 
-                # Protect the import loop from crashing the app: handle per-item exceptions
+                # per-item processing with diagnostics
                 try:
-                
-                    # Try HTML extraction first
                     text = ""
-                    extracted = fetch_and_extract_html(url)
+                    cookies_dict = cookie_header_to_dict(cookie_header)
+
+                    extracted = fetch_and_extract_html(url, cookies=cookies_dict)
                     if extracted and len(extracted) > 200:
                         text = extracted
-                        logs.append(f"✅ {i+1}/{total}: Extracted HTML ({len(text)} chars)")
+                        logs.append(f"✅ {global_idx}/{total}: Extracted HTML ({len(text)} chars)")
                     else:
-                        # Try PDF
+                        # perform HEAD to diagnose
+                        reason = None
+                        try:
+                            s_head = build_session(cookies_dict)
+                            head = s_head.head(url, headers={"User-Agent": "agile-biofoundry-bot/1.0"}, timeout=12, allow_redirects=True)
+                            reason = f"HEAD {head.status_code} {head.reason}; content-type: {head.headers.get('content-type')}"
+                        except Exception as he:
+                            reason = f"HEAD failed: {str(he)[:160]}"
+
+                        # Try PDF path
                         is_pdf = isinstance(url, str) and url.lower().endswith(".pdf")
-                        if not is_pdf:
-                            try:
-                                head = requests.head(url, headers={"User-Agent": "agile-biofoundry-bot/1.0"}, timeout=10, allow_redirects=True)
-                                ctype = head.headers.get("content-type", "")
-                                is_pdf = "pdf" in ctype.lower()
-                            except Exception:
-                                pass
+                        if not is_pdf and reason and "pdf" in (head.headers.get('content-type') or "").lower():
+                            is_pdf = True
 
                         if is_pdf:
                             dest = DATA_DIR / (str(uuid.uuid4()) + ".pdf")
-                            if download_file(url, dest):
+                            ok = download_file(url, dest, cookies=cookies_dict)
+                            if ok:
                                 try:
                                     pdf_text = extract_text_from_pdf(dest)
                                     if pdf_text and len(pdf_text) > 100:
                                         text = pdf_text
-                                        logs.append(f"✅ {i+1}/{total}: Extracted PDF ({len(text)} chars)")
+                                        logs.append(f"✅ {global_idx}/{total}: Extracted PDF ({len(text)} chars)")
                                     else:
-                                        logs.append(f"⚠️ {i+1}/{total}: PDF has no extractable text")
+                                        logs.append(f"⚠️ {global_idx}/{total}: PDF has no extractable text")
                                 finally:
-                                    # Clean up temp PDF to save disk/memory
                                     try:
                                         if dest.exists():
                                             dest.unlink()
                                     except Exception:
                                         pass
                             else:
-                                logs.append(f"❌ {i+1}/{total}: Failed to download PDF")
+                                logs.append(f"❌ {global_idx}/{total}: Failed to download PDF ({reason})")
                         else:
                             if extracted:
-                                logs.append(f"⚠️ {i+1}/{total}: HTML too small ({len(extracted)} chars, need >200)")
+                                logs.append(f"⚠️ {global_idx}/{total}: HTML too small ({len(extracted)} chars, need >200) -- {reason}")
                             else:
-                                logs.append(f"❌ {i+1}/{total}: Failed to extract any content")
+                                logs.append(f"❌ {global_idx}/{total}: Failed to extract any content -- {reason}")
 
+                except MemoryError as me:
+                    logs.append(f"❌ {global_idx}/{total}: MemoryError during processing: {str(me)[:200]}")
+                    # persist progress and stop batch to avoid crashing
+                    try:
+                        save_articles(articles)
+                    except Exception:
+                        pass
+                    st.session_state["lean_import_log"] = logs
+                    status_container.error("Import stopped: MemoryError encountered. Consider reducing batch size or increasing available memory.")
+                    break
                 except Exception as e:
-                    logs.append(f"❌ {i+1}/{total}: Error processing item: {str(e)[:120]}")
-                    # Continue to next item without crashing
+                    logs.append(f"❌ {global_idx}/{total}: Error {type(e).__name__}: {str(e)[:200]}")
                     continue
-                
-                # Truncate very large extracted text to avoid memory/JSON blowup
+
+                # Truncate very large extracted text
                 if isinstance(text, str) and len(text) > MAX_ARTICLE_TEXT:
                     text = text[:MAX_ARTICLE_TEXT] + "\n\n...[truncated]"
 
-                # Add article
                 new = {
                     "id": str(uuid.uuid4()),
                     "title": title,
@@ -756,28 +858,27 @@ def run_app():
                 existing_urls.add(url)
                 imported += 1
 
-                # Periodically persist progress to avoid losing work and to reduce memory pressure
                 if imported % 10 == 0:
                     try:
                         save_articles(articles)
                     except Exception:
                         pass
-                    # Encourage garbage collection and pause briefly to reduce peak memory and I/O
                     try:
                         gc.collect()
                         time.sleep(0.1)
                     except Exception:
                         pass
 
-            # Final save and finish
+            # finalize batch
             if imported > 0:
                 try:
                     save_articles(articles)
                 except Exception:
                     pass
             st.session_state["lean_import_log"] = logs
+            st.session_state["lean_import_pos"] = end
             progress_bar.progress(100)
-            status_container.success(f"✅ Import complete! Added {imported} articles.")
+            status_container.success(f"✅ Batch complete! Added {imported} articles. Next position: {st.session_state['lean_import_pos']}/{total}")
     
     # Display article count
     st.metric("Articles in library", len(articles))
@@ -866,7 +967,7 @@ def run_app():
                 if not url or not isinstance(url, str):
                     log_lines.append(f"**{a['title']}** — no URL provided")
                     continue
-                extracted = fetch_and_extract_html(url)
+                extracted = fetch_and_extract_html(url, cookies=cookie_header_to_dict(cookie_header))
                 if extracted and len(extracted) > 200:
                     a["text"] = extracted
                     updated += 1
