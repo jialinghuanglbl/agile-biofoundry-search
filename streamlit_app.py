@@ -597,22 +597,13 @@ def run_app():
             if api_endpoint:
                 with st.spinner("Fetching items via API..."):
                     links = fetch_items_api(api_endpoint, authorization_header, cookie_header, collection_id=collection_id)
+                    # Filter out API error fallback entries (URLs that are just the endpoint or contain "API fetch error")
+                    links = [l for l in links if not (l.get("url", "").startswith(api_endpoint) and "error" in l.get("title", "").lower())]
             else:
                 with st.spinner("Fetching links from Lean Library page..."):
                     links = fetch_lean_library_links(lean_page, cookie_header)
             if not links:
                 st.sidebar.warning("No candidate links found or failed to fetch the page. Check URL / cookies / auth token.")
-            else:
-                st.session_state["lean_fetched_links"] = links
-                st.sidebar.success(f"Found {len(links)} links (showing first 50).")
-    
-        if not lean_page:
-            st.sidebar.error("Provide a Lean Library page URL first.")
-        else:
-            with st.spinner("Fetching links from Lean Library page..."):
-                links = fetch_lean_library_links(lean_page, cookie_header)
-            if not links:
-                st.sidebar.warning("No candidate links found or failed to fetch the page. Check URL / cookies.")
             else:
                 st.session_state["lean_fetched_links"] = links
                 st.sidebar.success(f"Found {len(links)} links (showing first 50).")
