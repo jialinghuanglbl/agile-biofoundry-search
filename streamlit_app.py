@@ -272,16 +272,19 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
 
     results = []
     seen = set()
+    debug_info = []
 
     # Base (scheme + netloc) so we can resolve relative links like "/fulltext/..."
     parsed = urlparse(endpoint)
     base = f"{parsed.scheme}://{parsed.netloc}"
 
-    for a in items:
+    for idx, a in enumerate(items):
         if not isinstance(a, dict):
             continue
 
-        # Primary fields to check
+        article_title = a.get("title") or a.get("plainTitle") or "Untitled"
+        
+        # Primary fields to check (in priority order)
         raw_url = (
             a.get("fullTextLink")
             or a.get("url")
@@ -308,21 +311,30 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
                 raw_url = f"https://doi.org/{doi}"
 
         if not raw_url:
+            debug_info.append(f"  [{idx}] {article_title}: ❌ No URL found (checked fullTextLink, url, pdf, pdfResource, doi)")
             continue
 
         # Resolve relative URLs against the API host (base)
         try:
-            resolved = urljoin(base + "/", raw_url)
+            if raw_url.startswith("http"):
+                resolved = raw_url
+            else:
+                resolved = urljoin(base + "/", raw_url)
         except Exception:
             resolved = raw_url
 
         title = a.get("title") or a.get("plainTitle") or a.get("name") or a.get("article_title") or a.get("articleTitle") or None
 
         if resolved in seen:
+            debug_info.append(f"  [{idx}] {article_title}: ⏭️  Duplicate (already seen)")
             continue
 
+        debug_info.append(f"  [{idx}] {article_title}: ✅ {resolved[:80]}")
         results.append({"url": resolved, "title": title})
         seen.add(resolved)
+
+    # Store debug info in session for display
+    st.session_state["parse_debug"] = debug_info
 
     return results
 
@@ -608,6 +620,13 @@ def run_app():
     
     # Main area: Search and analysis
     st.header("Search & Analysis")
+    
+    # Display debug info from parsing if available
+    if "parse_debug" in st.session_state and st.session_state["parse_debug"]:
+        with st.expander("🐛 Parse Debug Info (Parser Results)", expanded=False):
+            st.write("**Per-article parsing results:**")
+            for line in st.session_state["parse_debug"]:
+                st.write(line)
     
     # Check if we have fetched links to display/import
     fetched = st.session_state.get("lean_fetched_links") if hasattr(st, "session_state") else None
