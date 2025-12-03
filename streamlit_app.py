@@ -7,7 +7,7 @@ from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from PyPDF2 import PdfReader
@@ -272,18 +272,58 @@ def fetch_items_api(endpoint: str, authorization: str | None = None, cookie_head
 
     results = []
     seen = set()
+
+    # Base (scheme + netloc) so we can resolve relative links like "/fulltext/..."
+    parsed = urlparse(endpoint)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
     for a in items:
         if not isinstance(a, dict):
             continue
-        # Sciwheel uses "fullTextLink" as the primary article URL field
-        url = a.get("fullTextLink") or a.get("url") or a.get("link") or a.get("pdf_url") or a.get("pdf") or a.get("file") or a.get("uri") or a.get("pdfUrl")
+
+        # Primary fields to check
+        raw_url = (
+            a.get("fullTextLink")
+            or a.get("url")
+            or a.get("link")
+            or a.get("pdf_url")
+            or a.get("pdf")
+            or a.get("file")
+            or a.get("uri")
+            or a.get("pdfUrl")
+        )
+
+        # If PDF resource is present, prefer its cloudFilePath as a downloadable link
+        if not raw_url:
+            pr = a.get("pdfResource") or a.get("pdf_resource")
+            if isinstance(pr, dict):
+                cloud = pr.get("cloudFilePath") or pr.get("cloud_file_path") or pr.get("cloudFile")
+                if cloud:
+                    raw_url = cloud
+
+        # DOI fallback
+        if not raw_url:
+            doi = a.get("doi")
+            if doi:
+                raw_url = f"https://doi.org/{doi}"
+
+        if not raw_url:
+            continue
+
+        # Resolve relative URLs against the API host (base)
+        try:
+            resolved = urljoin(base + "/", raw_url)
+        except Exception:
+            resolved = raw_url
+
         title = a.get("title") or a.get("plainTitle") or a.get("name") or a.get("article_title") or a.get("articleTitle") or None
-        if not url:
+
+        if resolved in seen:
             continue
-        if url in seen:
-            continue
-        results.append({"url": url, "title": title})
-        seen.add(url)
+
+        results.append({"url": resolved, "title": title})
+        seen.add(resolved)
+
     return results
 
 
