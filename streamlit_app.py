@@ -125,6 +125,12 @@ def download_file(url: str, dest: Path) -> bool:
                 f.write(chunk)
         return True
     except Exception:
+        # Remove partially-written file if present
+        try:
+            if dest.exists():
+                dest.unlink()
+        except Exception:
+            pass
         return False
 
 
@@ -662,40 +668,56 @@ def run_app():
                 if not url or url in existing_urls:
                     logs.append(f"⏭ {i+1}/{total}: Skipped (duplicate or no URL)")
                     continue
+
+                # Protect the import loop from crashing the app: handle per-item exceptions
+                try:
                 
-                # Try HTML extraction first
-                text = ""
-                extracted = fetch_and_extract_html(url)
-                if extracted and len(extracted) > 200:
-                    text = extracted
-                    logs.append(f"✅ {i+1}/{total}: Extracted HTML ({len(text)} chars)")
-                else:
-                    # Try PDF
-                    is_pdf = url.lower().endswith(".pdf")
-                    if not is_pdf:
-                        try:
-                            head = requests.head(url, headers={"User-Agent": "agile-biofoundry-bot/1.0"}, timeout=10, allow_redirects=True)
-                            ctype = head.headers.get("content-type", "")
-                            is_pdf = "pdf" in ctype.lower()
-                        except Exception:
-                            pass
-                    
-                    if is_pdf:
-                        dest = DATA_DIR / (str(uuid.uuid4()) + ".pdf")
-                        if download_file(url, dest):
-                            pdf_text = extract_text_from_pdf(dest)
-                            if pdf_text and len(pdf_text) > 100:
-                                text = pdf_text
-                                logs.append(f"✅ {i+1}/{total}: Extracted PDF ({len(text)} chars)")
-                            else:
-                                logs.append(f"⚠️ {i+1}/{total}: PDF has no extractable text")
-                        else:
-                            logs.append(f"❌ {i+1}/{total}: Failed to download PDF")
+                    # Try HTML extraction first
+                    text = ""
+                    extracted = fetch_and_extract_html(url)
+                    if extracted and len(extracted) > 200:
+                        text = extracted
+                        logs.append(f"✅ {i+1}/{total}: Extracted HTML ({len(text)} chars)")
                     else:
-                        if extracted:
-                            logs.append(f"⚠️ {i+1}/{total}: HTML too small ({len(extracted)} chars, need >200)")
+                        # Try PDF
+                        is_pdf = isinstance(url, str) and url.lower().endswith(".pdf")
+                        if not is_pdf:
+                            try:
+                                head = requests.head(url, headers={"User-Agent": "agile-biofoundry-bot/1.0"}, timeout=10, allow_redirects=True)
+                                ctype = head.headers.get("content-type", "")
+                                is_pdf = "pdf" in ctype.lower()
+                            except Exception:
+                                pass
+
+                        if is_pdf:
+                            dest = DATA_DIR / (str(uuid.uuid4()) + ".pdf")
+                            if download_file(url, dest):
+                                try:
+                                    pdf_text = extract_text_from_pdf(dest)
+                                    if pdf_text and len(pdf_text) > 100:
+                                        text = pdf_text
+                                        logs.append(f"✅ {i+1}/{total}: Extracted PDF ({len(text)} chars)")
+                                    else:
+                                        logs.append(f"⚠️ {i+1}/{total}: PDF has no extractable text")
+                                finally:
+                                    # Clean up temp PDF to save disk/memory
+                                    try:
+                                        if dest.exists():
+                                            dest.unlink()
+                                    except Exception:
+                                        pass
+                            else:
+                                logs.append(f"❌ {i+1}/{total}: Failed to download PDF")
                         else:
-                            logs.append(f"❌ {i+1}/{total}: Failed to extract any content")
+                            if extracted:
+                                logs.append(f"⚠️ {i+1}/{total}: HTML too small ({len(extracted)} chars, need >200)")
+                            else:
+                                logs.append(f"❌ {i+1}/{total}: Failed to extract any content")
+
+                except Exception as e:
+                    logs.append(f"❌ {i+1}/{total}: Error processing item: {str(e)[:120]}")
+                    # Continue to next item without crashing
+                    continue
                 
                 # Add article
                 new = {
@@ -710,14 +732,23 @@ def run_app():
                 articles.append(new)
                 existing_urls.add(url)
                 imported += 1
-            
-            # Save and finalize
+
+                # Periodically persist progress to avoid losing work and to reduce memory pressure
+                if imported % 10 == 0:
+                    try:
+                        save_articles(articles)
+                    except Exception:
+                        pass
+
+            # Final save and finish
             if imported > 0:
-                save_articles(articles)
+                try:
+                    save_articles(articles)
+                except Exception:
+                    pass
             st.session_state["lean_import_log"] = logs
             progress_bar.progress(100)
             status_container.success(f"✅ Import complete! Added {imported} articles.")
-            st.rerun()
     
     # Display article count
     st.metric("Articles in library", len(articles))
