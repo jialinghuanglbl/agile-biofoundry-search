@@ -2,10 +2,13 @@ import streamlit as st
 import os
 import json
 import uuid
+import time
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
 import requests
+import gc
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -16,6 +19,8 @@ from PyPDF2 import PdfReader
 DATA_DIR = Path("data")
 ARTICLES_PATH = DATA_DIR / "articles.json"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Maximum text stored per article (truncate very large PDFs/HTML to avoid OOM)
+MAX_ARTICLE_TEXT = 200_000
 
 # Initialize OpenAI client (requires OPENAI_API_KEY env var or st.secrets)
 def get_openai_client():
@@ -33,9 +38,23 @@ def load_articles():
     return []
 
 def save_articles(articles):
-    """Save articles to local storage."""
-    with open(ARTICLES_PATH, "w", encoding="utf-8") as f:
-        json.dump(articles, f, ensure_ascii=False, indent=2)
+    """Save articles to local storage.
+
+    Writes atomically (via a temp file) to avoid partial/corrupt files if the process is
+    interrupted or the Streamlit process is restarted while writing.
+    """
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=str(DATA_DIR)) as tf:
+            json.dump(articles, tf, ensure_ascii=False, indent=2)
+            tmpname = tf.name
+        Path(tmpname).replace(ARTICLES_PATH)
+    except Exception:
+        # Fallback to best-effort write
+        try:
+            with open(ARTICLES_PATH, "w", encoding="utf-8") as f:
+                json.dump(articles, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 def add_article(title, authors, abstract, url, text):
     """Add a new article to the collection."""
@@ -719,6 +738,10 @@ def run_app():
                     # Continue to next item without crashing
                     continue
                 
+                # Truncate very large extracted text to avoid memory/JSON blowup
+                if isinstance(text, str) and len(text) > MAX_ARTICLE_TEXT:
+                    text = text[:MAX_ARTICLE_TEXT] + "\n\n...[truncated]"
+
                 # Add article
                 new = {
                     "id": str(uuid.uuid4()),
@@ -737,6 +760,12 @@ def run_app():
                 if imported % 10 == 0:
                     try:
                         save_articles(articles)
+                    except Exception:
+                        pass
+                    # Encourage garbage collection and pause briefly to reduce peak memory and I/O
+                    try:
+                        gc.collect()
+                        time.sleep(0.1)
                     except Exception:
                         pass
 
