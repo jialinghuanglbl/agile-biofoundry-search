@@ -17,7 +17,6 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from PyPDF2 import PdfReader
 
 # ============================================================================
 # CONFIGURATION
@@ -28,7 +27,6 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_ARTICLE_TEXT = 200_000
 MAX_DOWNLOAD_BYTES = 5_000_000
-MAX_PDF_BYTES = 50_000_000
 
 RETRY_STRATEGY = Retry(
     total=3,
@@ -147,9 +145,14 @@ def delete_article(article_id: str) -> None:
 def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[str, str]:
     """
     Fetch URL and extract main article text with rate limiting.
+    Only processes HTML/web pages, skips PDFs.
     Returns: (content, reason) where reason explains success/failure.
     """
     time.sleep(delay)
+    
+    # Skip PDF URLs entirely
+    if url.lower().endswith('.pdf'):
+        return "", "Skipped: PDF link (use Web Link instead)"
     
     try:
         s = build_session(cookies)
@@ -168,7 +171,7 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         
         ctype = resp.headers.get("content-type", "")
         if "pdf" in ctype.lower():
-            return "", "Content-Type is PDF, needs separate PDF handler"
+            return "", "Skipped: Content-Type is PDF (use Web Link instead)"
 
         collected = bytearray()
         total = 0
@@ -183,7 +186,7 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         html = bytes(collected)
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 403:
-            return "", "403 Forbidden - Site blocks automated requests. Try: (1) institutional login cookies, (2) VPN, (3) manual download"
+            return "", "403 Forbidden - Site blocks automated requests. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
         elif e.response.status_code == 401:
             return "", "401 Unauthorized - Authentication required. Provide valid session cookies from DevTools"
         elif e.response.status_code == 404:
@@ -237,9 +240,9 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     if len(joined) > 200:
         return joined, "Extracted from paragraph tags"
     elif len(joined) > 0:
-        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall or login page"
+        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or try Web Link option"
     else:
-        return "", "No readable content found - page may require JavaScript or be behind paywall"
+        return "", "No readable content found - page may require JavaScript, be behind paywall, or need Web Link option"
 
 def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[bool, str]:
     """
@@ -517,7 +520,7 @@ def process_article_batch(
     existing_urls: set,
     rate_limit_delay: float = 2.0
 ) -> Tuple[List[Dict], List[str], int]:
-    """Process a batch of articles with detailed error reporting."""
+    """Process a batch of articles with detailed error reporting. HTML/Web links only."""
     new_articles = []
     logs = []
     imported = 0
@@ -530,6 +533,11 @@ def process_article_batch(
         if not url or url in existing_urls:
             logs.append(f"⏭ {global_idx}: Skipped (duplicate or no URL)")
             continue
+        
+        # Skip PDF URLs
+        if url.lower().endswith('.pdf'):
+            logs.append(f"⏭ {global_idx}: Skipped PDF URL - use Web Link option instead")
+            continue
 
         text = ""
         import_reason = ""
@@ -540,35 +548,9 @@ def process_article_batch(
             if extracted and len(extracted) > 200:
                 text = extracted
                 logs.append(f"✅ {global_idx}: {reason} ({len(text)} chars)")
-            elif extracted and len(extracted) > 0:
-                logs.append(f"⚠️ {global_idx}: Content too short ({len(extracted)} chars) - {reason}")
-                import_reason = reason
             else:
-                # No HTML content, try PDF
-                is_pdf = url.lower().endswith(".pdf") or "pdf" in reason.lower()
-                
-                if is_pdf or not extracted:
-                    dest = DATA_DIR / (str(uuid.uuid4()) + ".pdf")
-                    ok, pdf_reason = download_file(url, dest, cookies=cookies_dict, delay=rate_limit_delay)
-                    
-                    if ok:
-                        try:
-                            pdf_text, extract_reason = extract_text_from_pdf(dest)
-                            if pdf_text and len(pdf_text) > 100:
-                                text = pdf_text
-                                logs.append(f"✅ {global_idx}: PDF - {extract_reason} ({len(text)} chars)")
-                            else:
-                                logs.append(f"❌ {global_idx}: PDF - {extract_reason}")
-                                import_reason = extract_reason
-                        finally:
-                            if dest.exists():
-                                dest.unlink()
-                    else:
-                        logs.append(f"❌ {global_idx}: {pdf_reason}")
-                        import_reason = pdf_reason
-                else:
-                    logs.append(f"❌ {global_idx}: {reason}")
-                    import_reason = reason
+                logs.append(f"❌ {global_idx}: {reason}")
+                import_reason = reason
 
         except Exception as e:
             error_msg = f"Unexpected error: {type(e).__name__}: {str(e)[:100]}"
@@ -625,7 +607,8 @@ def run_app():
     # SIDEBAR: IMPORT & CONFIGURATION
     # ========================================================================
     st.sidebar.header("📚 Library Import")
-    st.sidebar.info("Import articles via API, page fetch, or file upload.")
+    st.sidebar.info("⚠️ **Important:** When importing, use 'Web Link' or 'DOI' options, NOT 'Open PDF' or 'Inst. Access' - this app extracts from HTML pages only.")
+
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Upload File")
@@ -950,7 +933,7 @@ def run_app():
                 for reason, count in sorted(reasons.items(), key=lambda x: x[1], reverse=True):
                     st.write(f"• {reason}: **{count}**")
                 
-                st.info("💡 Tip: Use institutional login cookies for 403 errors, or download PDFs manually")
+                st.info("💡 **Tips:**\n- Use 'Web Link' option instead of 'Open PDF'\n- Add institutional login cookies for 403 errors\n- Try VPN for blocked sites\n- Some sites require manual download")
 
 if __name__ == "__main__":
     run_app()
