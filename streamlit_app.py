@@ -150,9 +150,15 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     """
     time.sleep(delay)
     
-    # Skip PDF URLs entirely
-    if url.lower().endswith('.pdf'):
-        return "", "Skipped: PDF link (use Web Link instead)"
+    # Skip PDF URLs entirely - check multiple patterns
+    url_lower = url.lower()
+    if (url_lower.endswith('.pdf') or 
+        '/pdf/' in url_lower or
+        'download.pdf' in url_lower or
+        '/getpdf' in url_lower or
+        'pdf?' in url_lower or
+        'pdf=' in url_lower):
+        return "", f"Skipped: PDF URL detected in path ({url[:80]})"
     
     try:
         s = build_session(cookies)
@@ -420,7 +426,7 @@ def fetch_items_api(
             continue
 
         title = a.get("title") or a.get("plainTitle") or a.get("name") or None
-        debug_info.append(f"  [{idx}] {article_title}: ✅ {resolved[:80]}")
+        debug_info.append(f"  [{idx}] {article_title}: ✅ [{url_source}] {resolved[:70]}")
         results.append({"url": resolved, "title": title})
         seen.add(resolved)
 
@@ -534,9 +540,15 @@ def process_article_batch(
             logs.append(f"⏭ {global_idx}: Skipped (duplicate or no URL)")
             continue
         
-        # Skip PDF URLs
-        if url.lower().endswith('.pdf'):
-            logs.append(f"⏭ {global_idx}: Skipped PDF URL - use Web Link option instead")
+        # Skip PDF URLs - check multiple patterns
+        url_lower = url.lower()
+        if (url_lower.endswith('.pdf') or 
+            '/pdf/' in url_lower or
+            'download.pdf' in url_lower or
+            '/getpdf' in url_lower or
+            'pdf?' in url_lower or
+            'pdf=' in url_lower):
+            logs.append(f"⏭ {global_idx}: Skipped PDF URL - {url[:80]}")
             continue
 
         text = ""
