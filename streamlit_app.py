@@ -144,8 +144,11 @@ def delete_article(article_id: str) -> None:
 # ============================================================================
 # CONTENT EXTRACTION
 # ============================================================================
-def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: float = 1.0) -> str:
-    """Fetch URL and extract main article text with rate limiting."""
+def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[str, str]:
+    """
+    Fetch URL and extract main article text with rate limiting.
+    Returns: (content, reason) where reason explains success/failure.
+    """
     time.sleep(delay)
     
     try:
@@ -165,7 +168,7 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         
         ctype = resp.headers.get("content-type", "")
         if "pdf" in ctype.lower():
-            return ""
+            return "", "Content-Type is PDF, needs separate PDF handler"
 
         collected = bytearray()
         total = 0
@@ -180,10 +183,20 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         html = bytes(collected)
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 403:
-            return "[ACCESS_DENIED: 403 Forbidden]"
-        return f"[HTTP_ERROR: {e.response.status_code}]"
+            return "", "403 Forbidden - Site blocks automated requests. Try: (1) institutional login cookies, (2) VPN, (3) manual download"
+        elif e.response.status_code == 401:
+            return "", "401 Unauthorized - Authentication required. Provide valid session cookies from DevTools"
+        elif e.response.status_code == 404:
+            return "", "404 Not Found - URL may be broken or article removed"
+        elif e.response.status_code == 429:
+            return "", "429 Too Many Requests - Rate limited. Increase delay between requests"
+        return "", f"HTTP {e.response.status_code} error - Server rejected request"
+    except requests.exceptions.Timeout:
+        return "", "Timeout - Server took too long to respond (>20s)"
+    except requests.exceptions.ConnectionError:
+        return "", "Connection error - Network issue or invalid URL"
     except Exception as e:
-        return f"[FETCH_ERROR: {type(e).__name__}]"
+        return "", f"Fetch error ({type(e).__name__}): {str(e)[:100]}"
 
     try:
         soup = BeautifulSoup(html, "lxml")
@@ -191,21 +204,21 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         try:
             soup = BeautifulSoup(html, "html.parser")
         except Exception:
-            return "[PARSE_ERROR]"
+            return "", "HTML parsing failed - malformed content"
 
     # Try <article> tag
     article_tag = soup.find("article")
     if article_tag:
         text = article_tag.get_text(separator="\n", strip=True)
         if len(text) > 200:
-            return text
+            return text, "Extracted from <article> tag"
 
     # Try main or role=main
     main_tag = soup.find("main") or soup.find(attrs={"role": "main"})
     if main_tag:
         text = main_tag.get_text(separator="\n", strip=True)
         if len(text) > 200:
-            return text
+            return text, "Extracted from <main> tag"
 
     # Try largest div/section
     candidates = soup.find_all(["div", "section", "article", "main"])
@@ -215,14 +228,24 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         if len(t) > len(best):
             best = t
     if len(best) > 200:
-        return best
+        return best, "Extracted from largest content block"
 
     # Fallback: all paragraphs
     ps = [p.get_text(separator=" ", strip=True) for p in soup.find_all("p")]
-    return "\n\n".join(ps) if ps else "[NO_CONTENT_FOUND]"
+    joined = "\n\n".join(ps) if ps else ""
+    
+    if len(joined) > 200:
+        return joined, "Extracted from paragraph tags"
+    elif len(joined) > 0:
+        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall or login page"
+    else:
+        return "", "No readable content found - page may require JavaScript or be behind paywall"
 
-def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: float = 1.0) -> bool:
-    """Download a file with rate limiting."""
+def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[bool, str]:
+    """
+    Download a file with rate limiting.
+    Returns: (success, reason)
+    """
     time.sleep(delay)
     
     s = build_session(cookies)
@@ -242,17 +265,31 @@ def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: f
                     f.write(chunk)
                     total += len(chunk)
                     if total >= MAX_PDF_BYTES:
-                        raise Exception("File exceeds max allowed size")
-        return True
-    except Exception:
+                        raise Exception("File exceeds max allowed size (50MB)")
+        return True, f"Downloaded {total // 1024}KB"
+    except requests.exceptions.HTTPError as e:
         if dest.exists():
             dest.unlink()
-        return False
+        if e.response.status_code == 403:
+            return False, "403 Forbidden - PDF access requires authentication"
+        elif e.response.status_code == 404:
+            return False, "404 Not Found - PDF URL invalid"
+        return False, f"HTTP {e.response.status_code}"
+    except Exception as e:
+        if dest.exists():
+            dest.unlink()
+        return False, f"Download failed: {str(e)[:100]}"
 
-def extract_text_from_pdf(path: Path) -> str:
-    """Extract text from PDF file."""
+def extract_text_from_pdf(path: Path) -> Tuple[str, str]:
+    """
+    Extract text from PDF file.
+    Returns: (text, reason)
+    """
     try:
         reader = PdfReader(str(path))
+        if len(reader.pages) == 0:
+            return "", "PDF has no pages"
+        
         texts = []
         for p in reader.pages:
             try:
@@ -261,9 +298,14 @@ def extract_text_from_pdf(path: Path) -> str:
                 t = ""
             if t:
                 texts.append(t)
-        return "\n\n".join(texts)
-    except Exception:
-        return ""
+        
+        result = "\n\n".join(texts)
+        if len(result) > 100:
+            return result, f"Extracted from {len(reader.pages)} pages"
+        else:
+            return "", f"PDF has {len(reader.pages)} pages but no extractable text (may be scanned images)"
+    except Exception as e:
+        return "", f"PDF extraction failed: {str(e)[:100]}"
 
 # ============================================================================
 # API & LINK FETCHING
@@ -475,7 +517,7 @@ def process_article_batch(
     existing_urls: set,
     rate_limit_delay: float = 2.0
 ) -> Tuple[List[Dict], List[str], int]:
-    """Process a batch of articles with improved error handling."""
+    """Process a batch of articles with detailed error reporting."""
     new_articles = []
     logs = []
     imported = 0
@@ -490,42 +532,51 @@ def process_article_batch(
             continue
 
         text = ""
+        import_reason = ""
         
         try:
-            extracted = fetch_and_extract_html(url, cookies=cookies_dict, delay=rate_limit_delay)
+            extracted, reason = fetch_and_extract_html(url, cookies=cookies_dict, delay=rate_limit_delay)
             
-            if extracted and not extracted.startswith("[") and len(extracted) > 200:
+            if extracted and len(extracted) > 200:
                 text = extracted
-                logs.append(f"✅ {global_idx}: Extracted HTML ({len(text)} chars)")
-            elif "[ACCESS_DENIED:" in extracted:
-                logs.append(f"🔒 {global_idx}: Access denied - try institutional access/VPN")
-                continue
+                logs.append(f"✅ {global_idx}: {reason} ({len(text)} chars)")
+            elif extracted and len(extracted) > 0:
+                logs.append(f"⚠️ {global_idx}: Content too short ({len(extracted)} chars) - {reason}")
+                import_reason = reason
             else:
-                is_pdf = url.lower().endswith(".pdf")
-                if is_pdf:
+                # No HTML content, try PDF
+                is_pdf = url.lower().endswith(".pdf") or "pdf" in reason.lower()
+                
+                if is_pdf or not extracted:
                     dest = DATA_DIR / (str(uuid.uuid4()) + ".pdf")
-                    ok = download_file(url, dest, cookies=cookies_dict, delay=rate_limit_delay)
+                    ok, pdf_reason = download_file(url, dest, cookies=cookies_dict, delay=rate_limit_delay)
+                    
                     if ok:
                         try:
-                            pdf_text = extract_text_from_pdf(dest)
+                            pdf_text, extract_reason = extract_text_from_pdf(dest)
                             if pdf_text and len(pdf_text) > 100:
                                 text = pdf_text
-                                logs.append(f"✅ {global_idx}: Extracted PDF ({len(text)} chars)")
+                                logs.append(f"✅ {global_idx}: PDF - {extract_reason} ({len(text)} chars)")
                             else:
-                                logs.append(f"⚠️ {global_idx}: PDF has no extractable text")
+                                logs.append(f"❌ {global_idx}: PDF - {extract_reason}")
+                                import_reason = extract_reason
                         finally:
                             if dest.exists():
                                 dest.unlink()
                     else:
-                        logs.append(f"❌ {global_idx}: Failed to download PDF")
+                        logs.append(f"❌ {global_idx}: {pdf_reason}")
+                        import_reason = pdf_reason
                 else:
-                    logs.append(f"⚠️ {global_idx}: Content too small or inaccessible")
+                    logs.append(f"❌ {global_idx}: {reason}")
+                    import_reason = reason
 
         except Exception as e:
-            logs.append(f"❌ {global_idx}: Error {type(e).__name__}: {str(e)[:200]}")
+            error_msg = f"Unexpected error: {type(e).__name__}: {str(e)[:100]}"
+            logs.append(f"❌ {global_idx}: {error_msg}")
+            import_reason = error_msg
             continue
 
-        if text and not text.startswith("["):
+        if text:
             if len(text) > MAX_ARTICLE_TEXT:
                 text = text[:MAX_ARTICLE_TEXT] + "\n\n...[truncated]"
 
@@ -537,10 +588,26 @@ def process_article_batch(
                 "url": url,
                 "text": text,
                 "created_at": datetime.now().isoformat(),
+                "import_status": "success"
             }
             new_articles.append(new_article)
             existing_urls.add(url)
             imported += 1
+        elif import_reason:
+            # Store failed articles with reason
+            failed_article = {
+                "id": str(uuid.uuid4()),
+                "title": title,
+                "authors": [],
+                "abstract": None,
+                "url": url,
+                "text": "",
+                "created_at": datetime.now().isoformat(),
+                "import_status": "failed",
+                "import_reason": import_reason
+            }
+            new_articles.append(failed_article)
+            existing_urls.add(url)
 
     return new_articles, logs, imported
 
@@ -651,13 +718,16 @@ def run_app():
     articles = load_articles()
     
     st.header("📊 Library Overview")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total Articles", len(articles))
     with col2:
         articles_with_text = sum(1 for a in articles if a.get("text"))
         st.metric("With Full Text", articles_with_text)
     with col3:
+        failed_articles = sum(1 for a in articles if a.get("import_status") == "failed")
+        st.metric("Failed Imports", failed_articles)
+    with col4:
         fetched = st.session_state.get("lean_fetched_links", [])
         st.metric("Ready to Import", len(fetched))
 
@@ -791,17 +861,96 @@ def run_app():
     # ========================================================================
     st.sidebar.divider()
     st.sidebar.header("📖 Manage Articles")
+    
     if articles:
+        # Mass deletion options
+        with st.sidebar.expander("🗑️ Mass Delete"):
+            st.write("**Delete by status:**")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Delete Failed", help="Remove articles that failed to import"):
+                    failed_ids = [a["id"] for a in articles if a.get("import_status") == "failed"]
+                    if failed_ids:
+                        articles = [a for a in articles if a["id"] not in failed_ids]
+                        save_articles(articles)
+                        st.success(f"Deleted {len(failed_ids)} failed articles")
+                        st.rerun()
+                    else:
+                        st.info("No failed articles to delete")
+            
+            with col2:
+                if st.button("Delete Empty", help="Remove articles with no text"):
+                    empty_ids = [a["id"] for a in articles if not a.get("text")]
+                    if empty_ids:
+                        articles = [a for a in articles if a["id"] not in empty_ids]
+                        save_articles(articles)
+                        st.success(f"Deleted {len(empty_ids)} empty articles")
+                        st.rerun()
+                    else:
+                        st.info("No empty articles to delete")
+            
+            st.write("**Delete all:**")
+            if st.button("⚠️ Delete ALL Articles", type="secondary"):
+                st.session_state["confirm_delete_all"] = True
+            
+            if st.session_state.get("confirm_delete_all"):
+                st.warning("⚠️ This will delete ALL articles permanently!")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("✓ Confirm", type="primary"):
+                        save_articles([])
+                        st.session_state["confirm_delete_all"] = False
+                        st.success("All articles deleted")
+                        st.rerun()
+                with col_b:
+                    if st.button("✗ Cancel"):
+                        st.session_state["confirm_delete_all"] = False
+                        st.rerun()
+        
+        # View/delete individual articles
         with st.sidebar.expander(f"Articles ({len(articles)})"):
             for article in articles:
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     title_display = article['title'][:40] + "..." if len(article['title']) > 40 else article['title']
-                    st.write(f"**{title_display}**")
+                    status_icon = "❌" if article.get("import_status") == "failed" else "✅"
+                    st.write(f"{status_icon} **{title_display}**")
+                    if article.get("import_status") == "failed" and article.get("import_reason"):
+                        st.caption(f"Reason: {article['import_reason'][:60]}...")
                 with col2:
                     if st.button("🗑️", key=f"del_{article['id']}", help="Delete"):
                         delete_article(article['id'])
                         st.rerun()
+        
+        # Failed imports summary
+        failed = [a for a in articles if a.get("import_status") == "failed"]
+        if failed:
+            st.sidebar.divider()
+            with st.sidebar.expander(f"⚠️ Failed Imports ({len(failed)})"):
+                st.write("**Common failure reasons:**")
+                reasons = {}
+                for a in failed:
+                    reason = a.get("import_reason", "Unknown")
+                    # Categorize reasons
+                    if "403" in reason or "Forbidden" in reason:
+                        key = "403 Forbidden (auth required)"
+                    elif "404" in reason:
+                        key = "404 Not Found"
+                    elif "paywall" in reason.lower():
+                        key = "Paywall/login required"
+                    elif "too short" in reason.lower():
+                        key = "Content too short"
+                    elif "no extractable text" in reason.lower():
+                        key = "PDF scan (no text)"
+                    else:
+                        key = "Other errors"
+                    
+                    reasons[key] = reasons.get(key, 0) + 1
+                
+                for reason, count in sorted(reasons.items(), key=lambda x: x[1], reverse=True):
+                    st.write(f"• {reason}: **{count}**")
+                
+                st.info("💡 Tip: Use institutional login cookies for 403 errors, or download PDFs manually")
 
 if __name__ == "__main__":
     run_app()
