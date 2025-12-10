@@ -831,7 +831,7 @@ def process_article_batch(
 # ============================================================================
 def run_app():
     st.set_page_config(page_title="Agile Biofoundry Search", layout="wide")
-    st.title("🧬 Agile Biofoundry — Article Search & Analysis")
+    st.title("Agile Biofoundry — Article Search & Analysis")
 
     if "lean_import_pos" not in st.session_state:
         st.session_state.lean_import_pos = 0
@@ -839,8 +839,7 @@ def run_app():
     # ========================================================================
     # SIDEBAR: IMPORT & CONFIGURATION
     # ========================================================================
-    st.sidebar.header("📚 Library Import")
-    st.sidebar.info("⚠️ **Important:** When importing, use 'Web Link' or 'DOI' options, NOT 'Open PDF' or 'Inst. Access' - this app extracts from HTML pages only.")
+    st.sidebar.header("Library Import")
 
 
     st.sidebar.markdown("---")
@@ -870,7 +869,7 @@ def run_app():
         key="lean_api_auth"
     )
 
-    with st.sidebar.expander("🍪 Authentication Cookies"):
+    with st.sidebar.expander("Authentication Cookies"):
         st.markdown("""
 **Get cookies from DevTools:**
 1. Open library (logged in)
@@ -909,15 +908,15 @@ def run_app():
                 if resp.status_code == 200 and "login" not in resp.url.lower():
                     st.sidebar.success(f"✅ Valid")
                 else:
-                    st.sidebar.warning(f"⚠️ May be invalid")
+                    st.sidebar.warning(f"May be invalid")
             except Exception as e:
                 st.sidebar.error(f"❌ Failed: {str(e)[:100]}")
 
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        fetch_btn = st.button("🔍 Fetch", key="btn_fetch")
+        fetch_btn = st.button("Fetch", key="btn_fetch")
     with col2:
-        debug_btn = st.button("🐛 Debug", key="btn_debug")
+        debug_btn = st.button("Debug", key="btn_debug")
 
     if fetch_btn and api_endpoint:
         with st.spinner("Fetching..."):
@@ -933,7 +932,7 @@ def run_app():
     # ========================================================================
     articles = load_articles()
     
-    st.header("📊 Library Overview")
+    st.header("Library Overview")
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total Articles", len(articles))
@@ -950,7 +949,7 @@ def run_app():
     # Display fetched links
     if fetched:
         st.divider()
-        st.subheader("📋 Fetched Links")
+        st.subheader("Fetched Links")
         
         max_preview = min(20, len(fetched))
         for i, item in enumerate(fetched[:max_preview]):
@@ -960,7 +959,7 @@ def run_app():
             st.info(f"Showing {max_preview} of {len(fetched)} links")
 
         st.markdown("---")
-        st.subheader("⚙️ Batch Import")
+        st.subheader("Batch Import")
         
         import_pos = st.session_state.lean_import_pos
         total = len(fetched)
@@ -979,9 +978,9 @@ def run_app():
 
         col_a, col_b = st.columns(2)
         with col_a:
-            import_batch_btn = st.button("▶️ Import Batch", type="primary")
+            import_batch_btn = st.button("Import Batch", type="primary")
         with col_b:
-            reset_pos = st.button("🔄 Reset")
+            reset_pos = st.button("Reset")
 
         if reset_pos:
             st.session_state.lean_import_pos = 0
@@ -1028,7 +1027,7 @@ def run_app():
     # ========================================================================
     if articles:
         st.divider()
-        st.header("🔍 Search & Analysis")
+        st.header("Search & Analysis")
         
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -1080,7 +1079,7 @@ def run_app():
     
     if articles:
         # Mass deletion options
-        with st.sidebar.expander("🗑️ Mass Delete"):
+        with st.sidebar.expander("Mass Delete"):
             st.write("**Delete by status:**")
             col1, col2 = st.columns(2)
             with col1:
