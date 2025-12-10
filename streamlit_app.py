@@ -18,6 +18,14 @@ from urllib.parse import urljoin, urlparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# Optional: Selenium for JavaScript rendering (if available)
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -34,6 +42,18 @@ RETRY_STRATEGY = Retry(
     status_forcelist=(429, 500, 502, 503, 504),
     allowed_methods=["HEAD", "GET", "POST"]
 )
+
+# Domains known to block automated access - skip gracefully
+BLOCKED_DOMAINS = {
+    "annualreviews.org",  # Strict bot detection
+    "acs.org",  # ACS blocked
+    "nature.com",  # Paywall
+    "science.org",  # Science paywall
+    "sciencedirect.com",  # Elsevier paywall
+    "wiley.com",  # Wiley paywall
+    "springer.com",  # Springer paywall
+    "ieeexplore.ieee.org",  # IEEE paywall
+}
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -185,6 +205,14 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         'pdf?' in url_lower or
         'pdf=' in url_lower):
         return "", f"Skipped: PDF URL detected in path ({url[:80]})"
+    
+    # Check if domain is known to block automated access
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc.lower().replace('www.', '')
+    
+    for blocked_domain in BLOCKED_DOMAINS:
+        if blocked_domain in domain:
+            return "", f"Skipped: {blocked_domain} blocks automated access. Try: (1) institutional login, (2) VPN, (3) manual web link"
     
     try:
         s = build_session(cookies)
@@ -651,6 +679,25 @@ def process_article_batch(
             }
             new_articles.append(failed_article)
             existing_urls.add(url)
+
+    # Analyze blocked domains and provide summary
+    blocked_summary = {}
+    for log in logs:
+        for domain in BLOCKED_DOMAINS:
+            if domain in log:
+                blocked_summary[domain] = blocked_summary.get(domain, 0) + 1
+    
+    if blocked_summary:
+        logs.append("")
+        logs.append("📊 SUMMARY: Blocked Domains")
+        for domain, count in sorted(blocked_summary.items(), key=lambda x: -x[1]):
+            logs.append(f"  • {domain}: {count} articles")
+        logs.append("")
+        logs.append("💡 To access blocked content:")
+        logs.append("  1. Institutional login: Use your university/organization credentials")
+        logs.append("  2. VPN: Connect to institutional VPN to bypass geographic restrictions")
+        logs.append("  3. Library proxy: Some institutions provide proxy URLs")
+        logs.append("  4. DOI alternative: Try searching the DOI directly via https://doi.org/")
 
     return new_articles, logs, imported
 
