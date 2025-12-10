@@ -395,23 +395,32 @@ def fetch_items_api(
 
         article_title = a.get("title") or a.get("plainTitle") or "Untitled"
         
-        raw_url = (
-            a.get("fullTextLink") or a.get("url") or a.get("link") or
-            a.get("pdf_url") or a.get("pdf") or a.get("file") or
-            a.get("uri") or a.get("pdfUrl")
-        )
+        raw_url = None
+        url_source = None
+        
+        # Try primary fields
+        for source_field in ("fullTextLink", "url", "link", "pdf_url", "pdf", "file", "uri", "pdfUrl"):
+            val = a.get(source_field)
+            if val:
+                raw_url = val
+                url_source = source_field
+                break
 
+        # Try pdfResource
         if not raw_url:
             pr = a.get("pdfResource") or a.get("pdf_resource")
             if isinstance(pr, dict):
                 cloud = pr.get("cloudFilePath") or pr.get("cloud_file_path") or pr.get("cloudFile")
                 if cloud:
                     raw_url = cloud
+                    url_source = "pdfResource.cloudFilePath"
 
+        # Try DOI fallback
         if not raw_url:
             doi = a.get("doi")
             if doi:
                 raw_url = f"https://doi.org/{doi}"
+                url_source = "doi"
 
         if not raw_url:
             debug_info.append(f"  [{idx}] {article_title}: ❌ No URL found")
