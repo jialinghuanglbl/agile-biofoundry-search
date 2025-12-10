@@ -18,10 +18,13 @@ from urllib.parse import urljoin, urlparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Optional: Selenium for JavaScript rendering (if available)
+# Selenium for JavaScript rendering
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
     SELENIUM_AVAILABLE = True
 except ImportError:
     SELENIUM_AVAILABLE = False
@@ -35,6 +38,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_ARTICLE_TEXT = 200_000
 MAX_DOWNLOAD_BYTES = 5_000_000
+MAX_PDF_BYTES = 50_000_000
+SELENIUM_TIMEOUT = 15  # seconds to wait for page load
 
 RETRY_STRATEGY = Retry(
     total=3,
@@ -188,6 +193,67 @@ def extract_pdf_link_from_page(soup, base_url: str) -> Optional[str]:
     
     return None
 
+def render_with_selenium(url: str, cookies: Optional[Dict] = None) -> Tuple[str, str]:
+    """
+    Render a page using Selenium for JavaScript-heavy sites.
+    Returns: (html_content, reason)
+    """
+    if not SELENIUM_AVAILABLE:
+        return "", "Selenium not installed"
+    
+    driver = None
+    try:
+        # Setup Chrome options for headless mode
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("user-agent=" + get_random_user_agent())
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        
+        driver = webdriver.Chrome(options=options)
+        
+        # Add cookies if provided
+        if cookies:
+            driver.get(url.split('//', 1)[1].split('/')[0])  # Go to domain first
+            for name, value in cookies.items():
+                try:
+                    driver.add_cookie({"name": name, "value": value})
+                except Exception:
+                    pass  # Cookie may not be valid for this domain
+        
+        # Navigate to URL
+        driver.get(url)
+        
+        # Wait for content to load (either article tag or main content)
+        try:
+            if SELENIUM_AVAILABLE:
+                WebDriverWait(driver, SELENIUM_TIMEOUT).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+        except Exception:
+            pass  # Timeout is acceptable, work with what we have
+        
+        # Get rendered HTML
+        html = driver.page_source
+        
+        if html and len(html) > 500:
+            return html, "Rendered with Selenium (JavaScript)"
+        else:
+            return "", "Selenium rendered but page content empty"
+    
+    except Exception as e:
+        return "", f"Selenium rendering failed: {str(e)[:80]}"
+    
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
 def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[str, str]:
     """
     Fetch URL and extract main article text with rate limiting.
@@ -306,17 +372,51 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     if len(joined) > 200:
         return joined, "Extracted from paragraph tags"
     
-    # If we found minimal content, try to detect a PDF link on the page
-    # This helps with landing pages that host PDFs
-    if len(joined) < 100:
-        pdf_link = extract_pdf_link_from_page(soup, url)
-        if pdf_link:
-            return "", f"Detected PDF link on page: {pdf_link} (set as URL to download)"
+    # If content is too short or empty, try Selenium for JavaScript-rendered content
+    if len(joined) < 200:
+        if SELENIUM_AVAILABLE:
+            try:
+                selenium_html, selenium_reason = render_with_selenium(url, cookies)
+                if selenium_html and "failed" not in selenium_reason.lower():
+                    # Parse selenium-rendered HTML
+                    try:
+                        selenium_soup = BeautifulSoup(selenium_html, "lxml")
+                    except Exception:
+                        selenium_soup = BeautifulSoup(selenium_html, "html.parser")
+                    
+                    # Try extraction strategies again on rendered content
+                    article_tag = selenium_soup.find("article")
+                    if article_tag:
+                        text = article_tag.get_text(separator="\n", strip=True)
+                        if len(text) > 200:
+                            return text, f"{selenium_reason} - Extracted from <article> tag"
+                    
+                    main_tag = selenium_soup.find("main") or selenium_soup.find(attrs={"role": "main"})
+                    if main_tag:
+                        text = main_tag.get_text(separator="\n", strip=True)
+                        if len(text) > 200:
+                            return text, f"{selenium_reason} - Extracted from <main> tag"
+                    
+                    candidates = selenium_soup.find_all(["div", "section", "article", "main"])
+                    best = ""
+                    for c in candidates:
+                        t = c.get_text(separator="\n", strip=True)
+                        if len(t) > len(best):
+                            best = t
+                    if len(best) > 200:
+                        return best, f"{selenium_reason} - Extracted from largest content block"
+                    
+                    ps = [p.get_text(separator=" ", strip=True) for p in selenium_soup.find_all("p")]
+                    selenium_joined = "\n\n".join(ps) if ps else ""
+                    if len(selenium_joined) > 200:
+                        return selenium_joined, f"{selenium_reason} - Extracted from paragraph tags"
+            except Exception:
+                pass  # Selenium fallback failed, continue with standard response
     
     if len(joined) > 0:
-        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or JavaScript-heavy"
+        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or JavaScript-heavy. Try: (1) institutional login, (2) VPN, (3) Web Link instead of PDF"
     else:
-        return "", "No readable content found - page may require JavaScript, be behind paywall, or is a PDF landing page"
+        return "", "No readable content found - page may require JavaScript (install: pip install selenium), be behind paywall, or is a PDF landing page"
 
 def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[bool, str]:
     """
