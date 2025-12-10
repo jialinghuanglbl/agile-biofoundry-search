@@ -142,15 +142,41 @@ def delete_article(article_id: str) -> None:
 # ============================================================================
 # CONTENT EXTRACTION
 # ============================================================================
+def extract_pdf_link_from_page(soup, base_url: str) -> Optional[str]:
+    """
+    Try to find a PDF download link from an HTML page.
+    Useful for landing pages that host PDF viewers/containers.
+    """
+    # Look for direct PDF links
+    for link in soup.find_all('a', href=True):
+        href = link.get('href', '').lower()
+        if '.pdf' in href or 'download' in href or 'pdf' in link.get_text().lower():
+            pdf_url = link['href']
+            if not pdf_url.startswith('http'):
+                pdf_url = urljoin(base_url, pdf_url)
+            if pdf_url.lower().endswith('.pdf') or 'pdf' in pdf_url.lower():
+                return pdf_url
+    
+    # Look for iframe pointing to PDF
+    for iframe in soup.find_all('iframe', src=True):
+        src = iframe['src'].lower()
+        if '.pdf' in src or 'pdf' in src:
+            pdf_url = iframe['src']
+            if not pdf_url.startswith('http'):
+                pdf_url = urljoin(base_url, pdf_url)
+            return pdf_url
+    
+    return None
+
 def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[str, str]:
     """
     Fetch URL and extract main article text with rate limiting.
-    Only processes HTML/web pages, skips PDFs.
+    Only processes HTML/web pages, skips direct PDFs.
     Returns: (content, reason) where reason explains success/failure.
     """
     time.sleep(delay)
     
-    # Skip PDF URLs entirely - check multiple patterns
+    # Skip direct PDF URLs - check multiple patterns
     url_lower = url.lower()
     if (url_lower.endswith('.pdf') or 
         '/pdf/' in url_lower or
@@ -162,11 +188,17 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     
     try:
         s = build_session(cookies)
+        
+        # Parse URL to build smart referer
+        parsed = urlparse(url)
+        referer = f"{parsed.scheme}://{parsed.netloc}/"
+        
         headers = {
             "User-Agent": get_random_user_agent(),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
+            "Referer": referer,
             "DNT": "1",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
@@ -245,10 +277,18 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     
     if len(joined) > 200:
         return joined, "Extracted from paragraph tags"
-    elif len(joined) > 0:
-        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or try Web Link option"
+    
+    # If we found minimal content, try to detect a PDF link on the page
+    # This helps with landing pages that host PDFs
+    if len(joined) < 100:
+        pdf_link = extract_pdf_link_from_page(soup, url)
+        if pdf_link:
+            return "", f"Detected PDF link on page: {pdf_link} (set as URL to download)"
+    
+    if len(joined) > 0:
+        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or JavaScript-heavy"
     else:
-        return "", "No readable content found - page may require JavaScript, be behind paywall, or need Web Link option"
+        return "", "No readable content found - page may require JavaScript, be behind paywall, or is a PDF landing page"
 
 def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[bool, str]:
     """
