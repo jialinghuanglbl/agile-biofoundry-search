@@ -25,6 +25,13 @@ try:
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    # Optional webdriver-manager to auto-download chromedriver
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        from selenium.webdriver.chrome.service import Service
+        WEBDRIVER_MANAGER_AVAILABLE = True
+    except Exception:
+        WEBDRIVER_MANAGER_AVAILABLE = False
     SELENIUM_AVAILABLE = True
 except ImportError:
     SELENIUM_AVAILABLE = False
@@ -212,8 +219,26 @@ def render_with_selenium(url: str, cookies: Optional[Dict] = None) -> Tuple[str,
         options.add_argument("user-agent=" + get_random_user_agent())
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
+        # If a Chrome/Chromium binary exists on the system, point Selenium to it
+        from pathlib import Path as _Path
+        for _p in ("/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"):
+            if _Path(_p).exists():
+                options.binary_location = _p
+                break
         
-        driver = webdriver.Chrome(options=options)
+        # Try to use webdriver-manager to install a matching chromedriver
+        try:
+            if 'WEBDRIVER_MANAGER_AVAILABLE' in globals() and WEBDRIVER_MANAGER_AVAILABLE:
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=options)
+            else:
+                driver = webdriver.Chrome(options=options)
+        except TypeError:
+            # Older/newer selenium signatures may differ; try positional fallback
+            try:
+                driver = webdriver.Chrome(ChromeDriverManager().install(), options)
+            except Exception:
+                driver = webdriver.Chrome(options=options)
         
         # Add cookies if provided
         if cookies:
