@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<vpn rev="1.0">
+  <file version="5.1.10.233" id="VPNCore" is_core="yes" type="script" action="install">
+    <uri>binaries/cisco-secure-client-linux64-5.1.10.233-core-vpn-webdeploy-k9.sh</uri>
+    <display-name>Cisco Secure Client - AnyConnect VPN</display-name>
+  </file>
+</vpn>

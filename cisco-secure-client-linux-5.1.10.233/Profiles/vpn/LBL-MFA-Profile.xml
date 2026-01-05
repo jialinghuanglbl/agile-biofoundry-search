@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<AnyConnectProfile xmlns="http://schemas.xmlsoap.org/encoding/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://schemas.xmlsoap.org/encoding/ AnyConnectProfile.xsd">
+	<ClientInitialization>
+		<UseStartBeforeLogon UserControllable="true">false</UseStartBeforeLogon>
+		<AutomaticCertSelection UserControllable="false">true</AutomaticCertSelection>
+		<ShowPreConnectMessage>false</ShowPreConnectMessage>
+		<CertificateStore>All</CertificateStore>
+		<CertificateStoreMac>All</CertificateStoreMac>
+		<CertificateStoreLinux>All</CertificateStoreLinux>
+		<CertificateStoreOverride>true</CertificateStoreOverride>
+		<ProxySettings>Native</ProxySettings>
+		<AllowLocalProxyConnections>true</AllowLocalProxyConnections>
+		<AuthenticationTimeout>30</AuthenticationTimeout>
+		<AutoConnectOnStart UserControllable="false">true</AutoConnectOnStart>
+		<MinimizeOnConnect UserControllable="true">false</MinimizeOnConnect>
+		<LocalLanAccess UserControllable="false">false</LocalLanAccess>
+		<DisableCaptivePortalDetection UserControllable="true">false</DisableCaptivePortalDetection>
+		<ClearSmartcardPin UserControllable="true">true</ClearSmartcardPin>
+		<IPProtocolSupport>IPv4,IPv6</IPProtocolSupport>
+		<AutoReconnect UserControllable="true">true
+			<AutoReconnectBehavior UserControllable="false">ReconnectAfterResume</AutoReconnectBehavior>
+		</AutoReconnect>
+		<SuspendOnConnectedStandby>false</SuspendOnConnectedStandby>
+		<AutoUpdate UserControllable="false">false</AutoUpdate>
+		<RSASecurIDIntegration UserControllable="false">Automatic</RSASecurIDIntegration>
+		<WindowsLogonEnforcement>SingleLocalLogon</WindowsLogonEnforcement>
+		<LinuxLogonEnforcement>SingleLocalLogon</LinuxLogonEnforcement>
+		<WindowsVPNEstablishment>LocalUsersOnly</WindowsVPNEstablishment>
+		<LinuxVPNEstablishment>LocalUsersOnly</LinuxVPNEstablishment>
+		<AutomaticVPNPolicy>false</AutomaticVPNPolicy>
+		<PPPExclusion UserControllable="false">Disable
+			<PPPExclusionServerIP UserControllable="false"></PPPExclusionServerIP>
+		</PPPExclusion>
+		<EnableScripting UserControllable="false">false</EnableScripting>
+		<CertificateMatch>
+			<MatchOnlyCertsWithKU>false</MatchOnlyCertsWithKU>
+			<KeyUsage>
+				<MatchKey>Non_Repudiation</MatchKey>
+				<MatchKey>Digital_Signature</MatchKey>
+			</KeyUsage>
+			<ExtendedKeyUsage>
+				<ExtendedMatchKey>ClientAuth</ExtendedMatchKey>
+			</ExtendedKeyUsage>
+		</CertificateMatch>
+		<EnableAutomaticServerSelection UserControllable="false">false
+			<AutoServerSelectionImprovement>20</AutoServerSelectionImprovement>
+			<AutoServerSelectionSuspendTime>4</AutoServerSelectionSuspendTime>
+		</EnableAutomaticServerSelection>
+		<RetainVpnOnLogoff>false
+		</RetainVpnOnLogoff>
+		<CaptivePortalRemediationBrowserFailover>false</CaptivePortalRemediationBrowserFailover>
+		<AllowManualHostInput>true</AllowManualHostInput>
+	</ClientInitialization>
+	<ServerList>
+		<HostEntry>
+			<HostName>LBL-MFA-VPN</HostName>
+			<HostAddress>mfavpn.lbl.gov</HostAddress>
+		</HostEntry>
+	</ServerList>
+</AnyConnectProfile>

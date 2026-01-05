@@ -1,0 +1,19 @@
+<!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
+"http://www.freedesktop.org/standards/menu-spec/menu-1.0.dtd">
+
+<Menu>
+  <MergeFile type="path">cisco-secure-client-dart.menu</MergeFile>
+  <AppDir>/usr/share/applications</AppDir>
+  <DirectoryDir>/usr/share/desktop-directories</DirectoryDir>
+  <Name>Applications</Name>
+  <Menu>
+    <Name>Internet</Name>
+    <Menu>
+      <Name>Cisco Secure Client</Name>
+      <Directory>cisco-secure-client.directory</Directory>
+      <Include>
+        <Filename>com.cisco.secureclient.gui.desktop</Filename>
+      </Include>
+    </Menu>
+  </Menu>
+</Menu>

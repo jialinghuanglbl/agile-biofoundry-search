@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Cisco Secure Client
+Comment=Connect to a private network using the Cisco Secure Client
+Exec=/opt/cisco/secureclient/bin/vpnui
+Icon=cisco-secure-client
+Terminal=false
+Encoding=UTF-8
+StartupNotify=true

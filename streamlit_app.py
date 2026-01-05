@@ -46,7 +46,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 MAX_ARTICLE_TEXT = 200_000
 MAX_DOWNLOAD_BYTES = 5_000_000
 MAX_PDF_BYTES = 50_000_000
-SELENIUM_TIMEOUT = 15  # seconds to wait for page load
+SELENIUM_TIMEOUT = 20  # seconds to wait for page load
 
 RETRY_STRATEGY = Retry(
     total=3,
@@ -316,10 +316,11 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     # Check if domain is known to block automated access
     parsed_url = urlparse(url)
     domain = parsed_url.netloc.lower().replace('www.', '')
-    
+    is_blocked = False
     for blocked_domain in BLOCKED_DOMAINS:
         if blocked_domain in domain:
-            return "", f"Skipped: {blocked_domain} blocks automated access. Try: (1) institutional login, (2) VPN, (3) manual web link"
+            is_blocked = True
+            break
     
     try:
         s = build_session(cookies)
@@ -359,7 +360,31 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         html = bytes(collected)
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 403:
-            return "", "403 Forbidden - Site blocks automated requests. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
+            # Try Selenium as fallback for 403
+            if SELENIUM_AVAILABLE:
+                try:
+                    selenium_html, selenium_reason = render_with_selenium(url, cookies)
+                    if selenium_html and "failed" not in selenium_reason.lower():
+                        try:
+                            selenium_soup = BeautifulSoup(selenium_html, "lxml")
+                        except Exception:
+                            selenium_soup = BeautifulSoup(selenium_html, "html.parser")
+                        # Try extraction
+                        article_tag = selenium_soup.find("article")
+                        if article_tag:
+                            text = article_tag.get_text(separator="\n", strip=True)
+                            if len(text) > 200:
+                                return text, f"Selenium fallback for 403 - Extracted from <article> tag"
+                        # Add more extraction logic here if needed
+                        ps = [p.get_text(separator=" ", strip=True) for p in selenium_soup.find_all("p")]
+                        selenium_joined = "\n\n".join(ps) if ps else ""
+                        if len(selenium_joined) > 200:
+                            return selenium_joined, f"Selenium fallback for 403 - Extracted from paragraph tags"
+                    return "", f"403 Forbidden - Site blocks automated requests. Selenium also failed. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
+                except Exception:
+                    return "", f"403 Forbidden - Site blocks automated requests. Selenium failed. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
+            else:
+                return "", "403 Forbidden - Site blocks automated requests. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
         elif e.response.status_code == 401:
             return "", "401 Unauthorized - Authentication required. Provide valid session cookies from DevTools"
         elif e.response.status_code == 404:
@@ -455,9 +480,11 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
                 pass  # Selenium fallback failed, continue with standard response
     
     if len(joined) > 0:
-        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or JavaScript-heavy. Try: (1) institutional login, (2) VPN, (3) Web Link instead of PDF"
+        suffix = f" (Note: {domain} is known to block bots - may require institutional access)" if is_blocked else ""
+        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or JavaScript-heavy. Try: (1) institutional login, (2) VPN, (3) Web Link instead of PDF{suffix}"
     else:
-        return "", "No readable content found - page may require JavaScript (install: pip install selenium), be behind paywall, or is a PDF landing page"
+        suffix = f" (Note: {domain} is known to block bots - may require institutional access)" if is_blocked else ""
+        return "", f"No readable content found - page may require JavaScript (install: pip install selenium), be behind paywall, or is a PDF landing page{suffix}"
 
 def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[bool, str]:
     """
