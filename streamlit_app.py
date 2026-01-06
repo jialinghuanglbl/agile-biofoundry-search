@@ -374,6 +374,7 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     
     if is_blocked:
         url = EZPROXY_BASE + quote(url)
+        print(f"DEBUG: Rewrote blocked domain {domain} to EZproxy: {url}")
     
     try:
         s = build_session(cookies)
@@ -686,13 +687,27 @@ def fetch_items_api(
         raw_url = None
         url_source = None
         
-        # Try primary fields
-        for source_field in ("fullTextLink", "url", "link", "pdf_url", "pdf", "file", "uri", "pdfUrl"):
-            val = a.get(source_field)
-            if val:
-                raw_url = val
-                url_source = source_field
-                break
+        # Try links array with preferences
+        if not raw_url:
+            links = a.get("links") or a.get("linkList") or []
+            if isinstance(links, list):
+                # Check if domain is blocked to prefer Institutional Access
+                preferred_type = "Institutional Access" if any(
+                    blocked in (a.get("url") or "").lower() for blocked in BLOCKED_DOMAINS
+                ) else "Web Link"
+                
+                for link in links:
+                    if isinstance(link, dict) and link.get("type") == preferred_type:
+                        raw_url = link.get("url") or link.get("link")
+                        url_source = f"links.{preferred_type}"
+                        break
+                # Fallback to any link if preferred not found
+                if not raw_url:
+                    for link in links:
+                        if isinstance(link, dict) and link.get("url"):
+                            raw_url = link.get("url")
+                            url_source = f"links.{link.get('type', 'unknown')}"
+                            break
 
         # Try pdfResource
         if not raw_url:
