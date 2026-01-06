@@ -14,7 +14,7 @@ def test_playwright_vpn(url="https://www.nature.com/articles/s41586-020-2012-7")
     parsed_url = urlparse(url)
     domain = parsed_url.netloc.lower().replace('www.', '')
     blocked_domains = {
-        "acs.org", "science.org", 
+        "annualreviews.org", "acs.org", "science.org", 
         "sciencedirect.com", "wiley.com", "springer.com", "ieeexplore.ieee.org"
     }
     if any(blocked in domain for blocked in blocked_domains):
