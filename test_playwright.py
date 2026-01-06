@@ -17,12 +17,6 @@ class AcademicArticleFetcher:
         "tandfonline.com", "sagepub.com", "karger.com"
     }
     
-    EZPROXY_FORMATS = {
-        "login_url": "https://proxy.lbl.gov/login?url={url}",
-        "prefix": "https://{domain}.proxy.lbl.gov{path}",
-        "subdomain": "https://proxy-lbl-gov.{domain}{path}",
-    }
-    
     CONTENT_SELECTORS = [
         'article',
         'main',
@@ -74,7 +68,7 @@ class AcademicArticleFetcher:
             response = requests.get(test_url, timeout=10, allow_redirects=True)
             if self.debug:
                 print(f"✓ HTTP test to {test_url}: {response.status_code}")
-            return response.status_code in [200, 302, 401, 403]  # Any response means it's reachable
+            return response.status_code in [200, 302, 401, 403]
         except Exception as e:
             if self.debug:
                 print(f"✗ HTTP test failed: {e}")
@@ -82,25 +76,18 @@ class AcademicArticleFetcher:
     
     def check_vpn_status(self) -> bool:
         """Check if likely connected to VPN by testing proxy reachability."""
-        # Try multiple methods to detect VPN
-        
-        # Method 1: DNS resolution
         try:
-            import socket
             socket.gethostbyname("proxy.lbl.gov")
             if self.debug:
                 print("✓ proxy.lbl.gov DNS resolves")
             
-            # Method 2: HTTP request test
             if self.check_proxy_http():
                 if self.debug:
                     print("✓ proxy.lbl.gov responds to HTTP")
                 return True
             
-            # DNS works but HTTP failed - still assume VPN is connected
             return True
         except:
-            # Method 3: Fallback to socket test
             return self.check_proxy_reachable()
     
     def get_domain_info(self, url: str) -> Tuple[str, bool]:
@@ -116,19 +103,87 @@ class AcademicArticleFetcher:
         domain = parsed.netloc
         
         urls = []
-        
-        # Format 1: login?url= (most common)
         urls.append(("login_url", f"https://proxy.lbl.gov/login?url={quote(url)}"))
-        
-        # Format 2: domain prefix
         prefix_url = url.replace("://", f"://{domain}.proxy.lbl.gov/")
         urls.append(("prefix", prefix_url))
-        
-        # Format 3: subdomain style
         subdomain_url = url.replace(f"://{domain}", f"://proxy-lbl-gov.{domain}")
         urls.append(("subdomain", subdomain_url))
         
         return urls
+    
+    def test_proxy_access(self, url: str) -> dict:
+        """Test proxy access using simple HTTP requests before launching browser."""
+        results = {
+            'direct_access': False,
+            'proxy_reachable': False,
+            'proxy_login_page': False,
+            'needs_auth': False,
+            'details': []
+        }
+        
+        try:
+            import requests
+            
+            print("\n" + "="*60)
+            print("PRE-FLIGHT TESTS")
+            print("="*60)
+            
+            print("\n→ Test 1: Direct access to article")
+            try:
+                response = requests.get(url, timeout=10, allow_redirects=True)
+                results['details'].append(f"Direct access: {response.status_code}")
+                print(f"  Status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    text_lower = response.text.lower()
+                    if 'subscription' in text_lower or 'access denied' in text_lower or 'sign in' in text_lower:
+                        print("  ✗ Access denied (paywall detected)")
+                    else:
+                        print("  ✓ Might have direct access!")
+                        results['direct_access'] = True
+            except Exception as e:
+                print(f"  ✗ Failed: {e}")
+                results['details'].append(f"Direct access failed: {e}")
+            
+            print("\n→ Test 2: Proxy server reachability")
+            try:
+                response = requests.get("https://proxy.lbl.gov", timeout=10, allow_redirects=True)
+                results['proxy_reachable'] = True
+                print(f"  ✓ Proxy responds: {response.status_code}")
+                results['details'].append(f"Proxy reachable: {response.status_code}")
+            except Exception as e:
+                print(f"  ✗ Proxy not reachable: {e}")
+                results['details'].append(f"Proxy not reachable: {e}")
+            
+            print("\n→ Test 3: Proxy login URL")
+            proxy_url = f"https://proxy.lbl.gov/login?url={quote(url)}"
+            try:
+                response = requests.get(proxy_url, timeout=10, allow_redirects=True)
+                print(f"  Status: {response.status_code}")
+                print(f"  Final URL: {response.url}")
+                results['details'].append(f"Proxy login: {response.status_code}")
+                
+                text_lower = response.text.lower()
+                if 'login' in text_lower or 'username' in text_lower or 'password' in text_lower:
+                    print("  ✓ Reached proxy login page")
+                    results['proxy_login_page'] = True
+                    results['needs_auth'] = True
+                elif 'annual reviews' in text_lower or 'article' in text_lower:
+                    print("  ✓ Got through to article (no auth needed!)")
+                    results['proxy_login_page'] = True
+                    results['needs_auth'] = False
+                else:
+                    print("  ? Unclear response")
+                    print(f"  Preview: {response.text[:200]}")
+            except Exception as e:
+                print(f"  ✗ Failed: {e}")
+                results['details'].append(f"Proxy login failed: {e}")
+            
+        except ImportError:
+            print("⚠ requests library not available, skipping HTTP tests")
+            results['details'].append("requests library not available")
+        
+        return results
     
     def try_authentication(self, page) -> bool:
         """Attempt to authenticate on EZproxy login page."""
@@ -136,7 +191,6 @@ class AcademicArticleFetcher:
             print("⚠ No EZproxy credentials provided")
             return False
         
-        # Common EZproxy login form selectors
         login_selectors = [
             ('input[name="user"]', 'input[name="pass"]', 'input[type="submit"]'),
             ('input[name="username"]', 'input[name="password"]', 'input[type="submit"]'),
@@ -229,7 +283,6 @@ class AcademicArticleFetcher:
                     browser.close()
                     return False, None
                 
-                # Check if we're on a login page
                 if "login" in page.url.lower():
                     print("  → Login page detected")
                     if not self.try_authentication(page):
@@ -237,23 +290,19 @@ class AcademicArticleFetcher:
                         browser.close()
                         return False, None
                 
-                # Wait a bit for dynamic content
                 page.wait_for_timeout(2000)
                 
-                # Check for access denied
                 if self.check_access_denied(page):
                     print("  ✗ Access denied detected on page")
                     browser.close()
                     return False, None
                 
-                # Try to extract content
                 content = self.extract_content(page)
                 
                 if content and len(content) > 200:
                     print(f"  ✓ SUCCESS: Extracted {len(content)} characters")
                     print(f"  Preview: {content[:200]}...")
                     
-                    # Save debug screenshot if enabled
                     if self.debug:
                         screenshot_name = f"success_{method_name.replace(' ', '_')}.png"
                         page.screenshot(path=screenshot_name)
@@ -264,7 +313,6 @@ class AcademicArticleFetcher:
                 else:
                     print("  ✗ No substantial content found")
                     
-                    # Save debug screenshot
                     screenshot_name = f"failed_{method_name.replace(' ', '_')}.png"
                     page.screenshot(path=screenshot_name)
                     print(f"  → Screenshot saved: {screenshot_name}")
@@ -279,90 +327,8 @@ class AcademicArticleFetcher:
                 traceback.print_exc()
             return False, None
     
-    def test_proxy_access(self, url: str) -> dict:
-        """
-        Test proxy access using simple HTTP requests before launching browser.
-        Returns dict with test results.
-        """
-        results = {
-            'direct_access': False,
-            'proxy_reachable': False,
-            'proxy_login_page': False,
-            'needs_auth': False,
-            'details': []
-        }
-        
-        try:
-            import requests
-            
-            print("\n" + "="*60)
-            print("PRE-FLIGHT TESTS")
-            print("="*60)
-            
-            # Test 1: Direct access
-            print("\n→ Test 1: Direct access to article")
-            try:
-                response = requests.get(url, timeout=10, allow_redirects=True)
-                results['details'].append(f"Direct access: {response.status_code}")
-                print(f"  Status: {response.status_code}")
-                
-                if response.status_code == 200:
-                    text_lower = response.text.lower()
-                    if 'subscription' in text_lower or 'access denied' in text_lower or 'sign in' in text_lower:
-                        print("  ✗ Access denied (paywall detected)")
-                    else:
-                        print("  ✓ Might have direct access!")
-                        results['direct_access'] = True
-            except Exception as e:
-                print(f"  ✗ Failed: {e}")
-                results['details'].append(f"Direct access failed: {e}")
-            
-            # Test 2: Proxy reachability
-            print("\n→ Test 2: Proxy server reachability")
-            try:
-                response = requests.get("https://proxy.lbl.gov", timeout=10, allow_redirects=True)
-                results['proxy_reachable'] = True
-                print(f"  ✓ Proxy responds: {response.status_code}")
-                results['details'].append(f"Proxy reachable: {response.status_code}")
-            except Exception as e:
-                print(f"  ✗ Proxy not reachable: {e}")
-                results['details'].append(f"Proxy not reachable: {e}")
-            
-            # Test 3: Proxy login page
-            print("\n→ Test 3: Proxy login URL")
-            from urllib.parse import quote
-            proxy_url = f"https://proxy.lbl.gov/login?url={quote(url)}"
-            try:
-                response = requests.get(proxy_url, timeout=10, allow_redirects=True)
-                print(f"  Status: {response.status_code}")
-                print(f"  Final URL: {response.url}")
-                results['details'].append(f"Proxy login: {response.status_code}")
-                
-                text_lower = response.text.lower()
-                if 'login' in text_lower or 'username' in text_lower or 'password' in text_lower:
-                    print("  ✓ Reached proxy login page")
-                    results['proxy_login_page'] = True
-                    results['needs_auth'] = True
-                elif 'annual reviews' in text_lower or 'article' in text_lower:
-                    print("  ✓ Got through to article (no auth needed!)")
-                    results['proxy_login_page'] = True
-                    results['needs_auth'] = False
-                else:
-                    print("  ? Unclear response")
-                    print(f"  Preview: {response.text[:200]}")
-            except Exception as e:
-                print(f"  ✗ Failed: {e}")
-                results['details'].append(f"Proxy login failed: {e}")
-            
-        except ImportError:
-            print("⚠ requests library not available, skipping HTTP tests")
-            results['details'].append("requests library not available")
-        
-        return results
-        """
-        Main method to fetch article using all available strategies.
-        Returns (success: bool, content: Optional[str])
-        """
+    def fetch(self, url: str) -> Tuple[bool, Optional[str]]:
+        """Main method to fetch article using all available strategies."""
         print(f"\n{'='*60}")
         print(f"FETCHING: {url}")
         print(f"{'='*60}")
@@ -371,18 +337,34 @@ class AcademicArticleFetcher:
         print(f"Domain: {domain}")
         print(f"Needs proxy: {needs_proxy}")
         
-        # Check VPN status
         vpn_connected = self.check_vpn_status()
         print(f"VPN/Proxy reachable: {vpn_connected}")
         
-        # Strategy 1: Try direct access first (if on VPN or not a blocked domain)
-        if vpn_connected or not needs_proxy:
+        test_results = self.test_proxy_access(url)
+        
+        print("\n" + "="*60)
+        print("STRATEGY SELECTION")
+        print("="*60)
+        
+        if test_results['direct_access']:
+            print("✓ Pre-flight test suggests direct access works!")
+            print("  → Will try direct access first")
+        elif test_results['proxy_login_page'] and not test_results['needs_auth']:
+            print("✓ Pre-flight test suggests proxy works without auth!")
+            print("  → Will prioritize proxy methods")
+        elif test_results['proxy_login_page'] and test_results['needs_auth']:
+            print("⚠ Proxy requires authentication")
+            if self.ezproxy_username:
+                print("  → Will attempt login with provided credentials")
+            else:
+                print("  → No credentials provided, login may fail")
+        
+        if vpn_connected or not needs_proxy or test_results['direct_access']:
             print("\n→ Strategy 1: Direct access")
             success, content = self.try_fetch_with_method(url, "Direct Access")
             if success:
                 return True, content
         
-        # Strategy 2: Try EZproxy if needed and VPN is connected
         if needs_proxy and vpn_connected:
             ezproxy_urls = self.generate_ezproxy_urls(url)
             
@@ -395,11 +377,8 @@ class AcademicArticleFetcher:
                 if success:
                     return True, content
                 
-                # Brief delay between attempts
                 time.sleep(1)
         
-        # Strategy 3: Try direct access even if we think it needs proxy
-        # (sometimes institutional access is granted via IP)
         if needs_proxy and not vpn_connected:
             print("\n→ Strategy 3: Direct access (fallback)")
             print("  Note: VPN not detected, but trying anyway...")
@@ -407,7 +386,6 @@ class AcademicArticleFetcher:
             if success:
                 return True, content
         
-        # All strategies failed
         print(f"\n{'='*60}")
         print("ALL STRATEGIES FAILED")
         print(f"{'='*60}")
@@ -417,6 +395,13 @@ class AcademicArticleFetcher:
             print("  1. Connect to LBL VPN and try again")
             print("  2. Verify your EZproxy credentials")
             print("  3. Check if the article URL is correct")
+        elif test_results['needs_auth'] and not self.ezproxy_username:
+            print("\n💡 Suggestions:")
+            print("  1. Provide EZproxy credentials:")
+            print("     python script.py URL --username YOUR_USER --password YOUR_PASS")
+            print("  2. Or set environment variables:")
+            print("     set EZPROXY_USER=your_username")
+            print("     set EZPROXY_PASS=your_password")
         
         return False, None
 
@@ -437,7 +422,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Create fetcher
     fetcher = AcademicArticleFetcher(
         ezproxy_username=args.username,
         ezproxy_password=args.password,
@@ -445,7 +429,6 @@ def main():
         debug=args.debug
     )
     
-    # Fetch article
     success, content = fetcher.fetch(args.url)
     
     if success and content:
