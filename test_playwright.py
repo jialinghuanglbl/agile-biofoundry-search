@@ -47,6 +47,19 @@ class AcademicArticleFetcher:
         self.ezproxy_password = ezproxy_password or os.getenv('EZPROXY_PASS')
         self.headless = headless
         self.debug = debug
+        
+        # Use realistic, recent user agents (rotate to avoid fingerprinting)
+        self.user_agents = [
+            # Chrome 131 (Windows 10/11)
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            # Chrome 130 (Windows 10/11)
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            # Edge 131 (Windows 10/11)
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+            # Chrome 131 (macOS)
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        ]
+        self.current_ua_index = 0
     
     def check_proxy_reachable(self, proxy_host: str = "proxy.lbl.gov", 
                               port: int = 443, timeout: int = 5) -> bool:
@@ -242,6 +255,12 @@ class AcademicArticleFetcher:
             pass
         return False
     
+    def get_user_agent(self) -> str:
+        """Get next user agent from rotation."""
+        ua = self.user_agents[self.current_ua_index]
+        self.current_ua_index = (self.current_ua_index + 1) % len(self.user_agents)
+        return ua
+    
     def try_fetch_with_method(self, url: str, method_name: str) -> Tuple[bool, Optional[str]]:
         """Try to fetch article using a specific method."""
         print(f"\n{'='*60}")
@@ -260,10 +279,21 @@ class AcademicArticleFetcher:
                 )
                 
                 context = browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    user_agent=self.get_user_agent(),
                     viewport={'width': 1920, 'height': 1080},
                     locale='en-US',
                     timezone_id='America/Los_Angeles',
+                    # Additional fingerprinting resistance
+                    extra_http_headers={
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1',
+                        'Upgrade-Insecure-Requests': '1',
+                    }
                 )
                 
                 page = context.new_page()
