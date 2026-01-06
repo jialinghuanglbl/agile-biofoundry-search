@@ -14,18 +14,24 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import gc
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Selenium for JavaScript rendering
+# Browser automation for JavaScript rendering
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+# Legacy Selenium fallback
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    # Optional webdriver-manager to auto-download chromedriver
     try:
         from webdriver_manager.chrome import ChromeDriverManager
         from selenium.webdriver.chrome.service import Service
@@ -74,10 +80,13 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
+# EZproxy for LBL institutional access (use when VPN IP access fails)
+EZPROXY_BASE = "https://proxy.lbl.gov/login?url="
+
 # ============================================================================
 # SESSION & REQUEST HELPERS
 # ============================================================================
-def build_session(cookies: Optional[Dict] = None) -> requests.Session:
+def build_session(cookies: Optional[Dict] = None, use_proxy: bool = False) -> requests.Session:
     """Create a requests session with retry logic and proper headers."""
     s = requests.Session()
     adapter = HTTPAdapter(max_retries=RETRY_STRATEGY)
@@ -85,6 +94,8 @@ def build_session(cookies: Optional[Dict] = None) -> requests.Session:
     s.mount("http://", adapter)
     if cookies:
         s.cookies.update(cookies)
+    if use_proxy:
+        s.proxies = {'http': 'http://proxy.lbl.gov:80', 'https': 'http://proxy.lbl.gov:80'}
     return s
 
 def get_random_user_agent() -> str:
@@ -200,100 +211,137 @@ def extract_pdf_link_from_page(soup, base_url: str) -> Optional[str]:
     
     return None
 
-def render_with_selenium(url: str, cookies: Optional[Dict] = None) -> Tuple[str, str]:
+def render_with_browser(url: str, cookies: Optional[Dict] = None) -> Tuple[str, str]:
     """
-    Render a page using Selenium for JavaScript-heavy sites.
+    Render a page using browser automation for JavaScript-heavy sites.
+    Tries Playwright first, then Selenium as fallback.
     Returns: (html_content, reason)
     """
-    if not SELENIUM_AVAILABLE:
-        return "", "Selenium not installed"
+    print(f"DEBUG: Starting browser automation for {url[:80]}...")
+    # Try Playwright first
+    if PLAYWRIGHT_AVAILABLE:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-accelerated-2d-canvas',
+                        '--no-first-run',
+                        '--no-zygote',
+                        '--disable-gpu'
+                    ]
+                )
+                context = browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    viewport={'width': 1920, 'height': 1080},
+                    locale='en-US',
+                    timezone_id='America/Los_Angeles'
+                )
+                
+                # Add cookies if provided
+                if cookies:
+                    domain = url.split('//', 1)[1].split('/')[0]
+                    for name, value in cookies.items():
+                        context.add_cookies([{
+                            'name': name,
+                            'value': value,
+                            'domain': domain,
+                            'path': '/'
+                        }])
+                
+                page = context.new_page()
+                page.goto(url, wait_until='networkidle', timeout=30000)
+                
+                # Wait a bit for dynamic content
+                page.wait_for_timeout(2000)
+                
+                html = page.content()
+                browser.close()
+                
+                if html and len(html) > 500:
+                    return html, "Rendered with Playwright"
+                else:
+                    return "", "Playwright rendered but page content empty"
+        except Exception as e:
+            return "", f"Playwright rendering failed: {str(e)[:80]}"
     
-    driver = None
-    try:
-        # Setup Chrome options for headless mode
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        # If a Chrome/Chromium binary exists on the system, point Selenium to it
-        from pathlib import Path as _Path
-        for _p in ("/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"):
-            if _Path(_p).exists():
-                options.binary_location = _p
-                break
-        
-        # Try to use webdriver-manager to install a matching chromedriver
+    # Fallback to Selenium
+    if SELENIUM_AVAILABLE:
         try:
-            if 'WEBDRIVER_MANAGER_AVAILABLE' in globals() and WEBDRIVER_MANAGER_AVAILABLE:
-                service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=options)
-            else:
-                driver = webdriver.Chrome(options=options)
-        except TypeError:
-            # Older/newer selenium signatures may differ; try positional fallback
+            # Setup Chrome options for headless mode
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            
+            # Try to use webdriver-manager to install a matching chromedriver
             try:
-                driver = webdriver.Chrome(ChromeDriverManager().install(), options)
-            except Exception:
-                driver = webdriver.Chrome(options=options)
-        
-        # Add cookies if provided
-        if cookies:
-            driver.get(url.split('//', 1)[1].split('/')[0])  # Go to domain first
-            for name, value in cookies.items():
+                if 'WEBDRIVER_MANAGER_AVAILABLE' in globals() and WEBDRIVER_MANAGER_AVAILABLE:
+                    service = Service(ChromeDriverManager().install())
+                    driver = webdriver.Chrome(service=service, options=options)
+                else:
+                    driver = webdriver.Chrome(options=options)
+            except TypeError:
                 try:
-                    driver.add_cookie({"name": name, "value": value})
+                    driver = webdriver.Chrome(ChromeDriverManager().install(), options)
                 except Exception:
-                    pass  # Cookie may not be valid for this domain
-        
-        # Set extra HTTP headers to make requests look more realistic
-        driver.execute_cdp_cmd('Network.enable', {})
-        extra_headers = {
-            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'accept-language': 'en-US,en;q=0.9',
-            'sec-ch-ua': '"Not/A)Brand";v="99", "Google Chrome";v="115", "Chromium";v="115"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'none',
-            'sec-fetch-user': '?1',
-            'upgrade-insecure-requests': '1',
-        }
-        driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {'headers': extra_headers})
-        
-        # Navigate to URL
-        driver.get(url)
-        
-        # Wait for content to load (either article tag or main content)
-        try:
-            if SELENIUM_AVAILABLE:
+                    driver = webdriver.Chrome(options=options)
+            
+            # Add cookies if provided
+            if cookies:
+                driver.get(url.split('//', 1)[1].split('/')[0])  # Go to domain first
+                for name, value in cookies.items():
+                    try:
+                        driver.add_cookie({"name": name, "value": value})
+                    except Exception:
+                        pass  # Cookie may not be valid for this domain
+            
+            # Set extra HTTP headers to make requests look more realistic
+            driver.execute_cdp_cmd('Network.enable', {})
+            extra_headers = {
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'accept-language': 'en-US,en;q=0.9',
+                'sec-ch-ua': '"Not/A)Brand";v="99", "Google Chrome";v="115", "Chromium";v="115"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-fetch-dest': 'document',
+                'sec-fetch-mode': 'navigate',
+                'sec-fetch-site': 'none',
+                'sec-fetch-user': '?1',
+                'upgrade-insecure-requests': '1',
+            }
+            driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {'headers': extra_headers})
+            
+            # Navigate to URL
+            driver.get(url)
+            
+            # Wait for content to load
+            try:
                 WebDriverWait(driver, SELENIUM_TIMEOUT).until(
                     EC.presence_of_element_located((By.TAG_NAME, "body"))
                 )
-        except Exception:
-            pass  # Timeout is acceptable, work with what we have
-        
-        # Get rendered HTML
-        html = driver.page_source
-        
-        if html and len(html) > 500:
-            return html, "Rendered with Selenium (JavaScript)"
-        else:
-            return "", "Selenium rendered but page content empty"
-    
-    except Exception as e:
-        return "", f"Selenium rendering failed: {str(e)[:80]}"
-    
-    finally:
-        if driver:
-            try:
-                driver.quit()
             except Exception:
                 pass
+            
+            # Get rendered HTML
+            html = driver.page_source
+            driver.quit()
+            
+            if html and len(html) > 500:
+                return html, "Rendered with Selenium (fallback)"
+            else:
+                return "", "Selenium rendered but page content empty"
+        except Exception as e:
+            return "", f"Selenium rendering failed: {str(e)[:80]}"
+    
+    return "", "No browser automation available"
 
 def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[str, str]:
     """
@@ -301,6 +349,8 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     Only processes HTML/web pages, skips direct PDFs.
     Returns: (content, reason) where reason explains success/failure.
     """
+    print(f"DEBUG: Fetching {url[:80]}...")
+    print(f"DEBUG: Playwright available: {PLAYWRIGHT_AVAILABLE}, Selenium available: {SELENIUM_AVAILABLE}")
     time.sleep(delay)
     
     # Skip direct PDF URLs - check multiple patterns
@@ -321,6 +371,10 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         if blocked_domain in domain:
             is_blocked = True
             break
+    
+    if is_blocked:
+        url = EZPROXY_BASE + quote(url)
+        print(f"DEBUG: Rewrote blocked domain {domain} to EZproxy: {url}")
     
     try:
         s = build_session(cookies)
@@ -360,29 +414,28 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         html = bytes(collected)
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 403:
-            # Try Selenium as fallback for 403
-            if SELENIUM_AVAILABLE:
+            # Try browser automation as fallback for 403
+            if PLAYWRIGHT_AVAILABLE or SELENIUM_AVAILABLE:
                 try:
-                    selenium_html, selenium_reason = render_with_selenium(url, cookies)
-                    if selenium_html and "failed" not in selenium_reason.lower():
+                    browser_html, browser_reason = render_with_browser(url, cookies)
+                    if browser_html and "failed" not in browser_reason.lower():
                         try:
-                            selenium_soup = BeautifulSoup(selenium_html, "lxml")
+                            browser_soup = BeautifulSoup(browser_html, "lxml")
                         except Exception:
-                            selenium_soup = BeautifulSoup(selenium_html, "html.parser")
+                            browser_soup = BeautifulSoup(browser_html, "html.parser")
                         # Try extraction
-                        article_tag = selenium_soup.find("article")
+                        article_tag = browser_soup.find("article")
                         if article_tag:
                             text = article_tag.get_text(separator="\n", strip=True)
                             if len(text) > 200:
-                                return text, f"Selenium fallback for 403 - Extracted from <article> tag"
-                        # Add more extraction logic here if needed
-                        ps = [p.get_text(separator=" ", strip=True) for p in selenium_soup.find_all("p")]
-                        selenium_joined = "\n\n".join(ps) if ps else ""
-                        if len(selenium_joined) > 200:
-                            return selenium_joined, f"Selenium fallback for 403 - Extracted from paragraph tags"
-                    return "", f"403 Forbidden - Site blocks automated requests. Selenium also failed. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
+                                return text, f"Browser automation fallback for 403 - Extracted from <article> tag"
+                        ps = [p.get_text(separator=" ", strip=True) for p in browser_soup.find_all("p")]
+                        browser_joined = "\n\n".join(ps) if ps else ""
+                        if len(browser_joined) > 200:
+                            return browser_joined, f"Browser automation fallback for 403 - Extracted from paragraph tags"
+                    return "", f"403 Forbidden - Site blocks automated requests. Browser automation also failed. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
                 except Exception:
-                    return "", f"403 Forbidden - Site blocks automated requests. Selenium failed. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
+                    return "", f"403 Forbidden - Site blocks automated requests. Browser automation failed. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
             else:
                 return "", "403 Forbidden - Site blocks automated requests. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
         elif e.response.status_code == 401:
@@ -438,53 +491,53 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
     if len(joined) > 200:
         return joined, "Extracted from paragraph tags"
     
-    # If content is too short or empty, try Selenium for JavaScript-rendered content
+    # If content is too short or empty, try browser automation for JavaScript-rendered content
     if len(joined) < 200:
-        if SELENIUM_AVAILABLE:
+        if PLAYWRIGHT_AVAILABLE or SELENIUM_AVAILABLE:
             try:
-                selenium_html, selenium_reason = render_with_selenium(url, cookies)
-                if selenium_html and "failed" not in selenium_reason.lower():
-                    # Parse selenium-rendered HTML
+                browser_html, browser_reason = render_with_browser(url, cookies)
+                if browser_html and "failed" not in browser_reason.lower():
+                    # Parse browser-rendered HTML
                     try:
-                        selenium_soup = BeautifulSoup(selenium_html, "lxml")
+                        browser_soup = BeautifulSoup(browser_html, "lxml")
                     except Exception:
-                        selenium_soup = BeautifulSoup(selenium_html, "html.parser")
+                        browser_soup = BeautifulSoup(browser_html, "html.parser")
                     
                     # Try extraction strategies again on rendered content
-                    article_tag = selenium_soup.find("article")
+                    article_tag = browser_soup.find("article")
                     if article_tag:
                         text = article_tag.get_text(separator="\n", strip=True)
                         if len(text) > 200:
-                            return text, f"{selenium_reason} - Extracted from <article> tag"
+                            return text, f"{browser_reason} - Extracted from <article> tag"
                     
-                    main_tag = selenium_soup.find("main") or selenium_soup.find(attrs={"role": "main"})
+                    main_tag = browser_soup.find("main") or browser_soup.find(attrs={"role": "main"})
                     if main_tag:
                         text = main_tag.get_text(separator="\n", strip=True)
                         if len(text) > 200:
-                            return text, f"{selenium_reason} - Extracted from <main> tag"
+                            return text, f"{browser_reason} - Extracted from <main> tag"
                     
-                    candidates = selenium_soup.find_all(["div", "section", "article", "main"])
+                    candidates = browser_soup.find_all(["div", "section", "article", "main"])
                     best = ""
                     for c in candidates:
                         t = c.get_text(separator="\n", strip=True)
                         if len(t) > len(best):
                             best = t
                     if len(best) > 200:
-                        return best, f"{selenium_reason} - Extracted from largest content block"
+                        return best, f"{browser_reason} - Extracted from largest content block"
                     
-                    ps = [p.get_text(separator=" ", strip=True) for p in selenium_soup.find_all("p")]
-                    selenium_joined = "\n\n".join(ps) if ps else ""
-                    if len(selenium_joined) > 200:
-                        return selenium_joined, f"{selenium_reason} - Extracted from paragraph tags"
+                    ps = [p.get_text(separator=" ", strip=True) for p in browser_soup.find_all("p")]
+                    browser_joined = "\n\n".join(ps) if ps else ""
+                    if len(browser_joined) > 200:
+                        return browser_joined, f"{browser_reason} - Extracted from paragraph tags"
             except Exception:
-                pass  # Selenium fallback failed, continue with standard response
+                pass  # Browser automation fallback failed, continue with standard response
     
     if len(joined) > 0:
         suffix = f" (Note: {domain} is known to block bots - may require institutional access)" if is_blocked else ""
         return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or JavaScript-heavy. Try: (1) institutional login, (2) VPN, (3) Web Link instead of PDF{suffix}"
     else:
         suffix = f" (Note: {domain} is known to block bots - may require institutional access)" if is_blocked else ""
-        return "", f"No readable content found - page may require JavaScript (install: pip install selenium), be behind paywall, or is a PDF landing page{suffix}"
+        return "", f"No readable content found - page may require JavaScript (install: pip install playwright selenium), be behind paywall, or is a PDF landing page{suffix}"
 
 def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[bool, str]:
     """
@@ -634,13 +687,27 @@ def fetch_items_api(
         raw_url = None
         url_source = None
         
-        # Try primary fields
-        for source_field in ("fullTextLink", "url", "link", "pdf_url", "pdf", "file", "uri", "pdfUrl"):
-            val = a.get(source_field)
-            if val:
-                raw_url = val
-                url_source = source_field
-                break
+        # Try links array with preferences
+        if not raw_url:
+            links = a.get("links") or a.get("linkList") or []
+            if isinstance(links, list):
+                # Check if domain is blocked to prefer Institutional Access
+                preferred_type = "Institutional Access" if any(
+                    blocked in (a.get("url") or "").lower() for blocked in BLOCKED_DOMAINS
+                ) else "Web Link"
+                
+                for link in links:
+                    if isinstance(link, dict) and link.get("type") == preferred_type:
+                        raw_url = link.get("url") or link.get("link")
+                        url_source = f"links.{preferred_type}"
+                        break
+                # Fallback to any link if preferred not found
+                if not raw_url:
+                    for link in links:
+                        if isinstance(link, dict) and link.get("url"):
+                            raw_url = link.get("url")
+                            url_source = f"links.{link.get('type', 'unknown')}"
+                            break
 
         # Try pdfResource
         if not raw_url:
