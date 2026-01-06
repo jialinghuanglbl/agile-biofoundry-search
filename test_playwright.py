@@ -67,9 +67,41 @@ class AcademicArticleFetcher:
                 print(f"✗ Cannot reach {proxy_host}:{port} - {e}")
             return False
     
+    def check_proxy_http(self, test_url: str = "https://proxy.lbl.gov") -> bool:
+        """Check if proxy is reachable via HTTP request."""
+        try:
+            import requests
+            response = requests.get(test_url, timeout=10, allow_redirects=True)
+            if self.debug:
+                print(f"✓ HTTP test to {test_url}: {response.status_code}")
+            return response.status_code in [200, 302, 401, 403]  # Any response means it's reachable
+        except Exception as e:
+            if self.debug:
+                print(f"✗ HTTP test failed: {e}")
+            return False
+    
     def check_vpn_status(self) -> bool:
         """Check if likely connected to VPN by testing proxy reachability."""
-        return self.check_proxy_reachable()
+        # Try multiple methods to detect VPN
+        
+        # Method 1: DNS resolution
+        try:
+            import socket
+            socket.gethostbyname("proxy.lbl.gov")
+            if self.debug:
+                print("✓ proxy.lbl.gov DNS resolves")
+            
+            # Method 2: HTTP request test
+            if self.check_proxy_http():
+                if self.debug:
+                    print("✓ proxy.lbl.gov responds to HTTP")
+                return True
+            
+            # DNS works but HTTP failed - still assume VPN is connected
+            return True
+        except:
+            # Method 3: Fallback to socket test
+            return self.check_proxy_reachable()
     
     def get_domain_info(self, url: str) -> Tuple[str, bool]:
         """Extract domain and check if it's in blocked list."""
@@ -247,7 +279,86 @@ class AcademicArticleFetcher:
                 traceback.print_exc()
             return False, None
     
-    def fetch(self, url: str) -> Tuple[bool, Optional[str]]:
+    def test_proxy_access(self, url: str) -> dict:
+        """
+        Test proxy access using simple HTTP requests before launching browser.
+        Returns dict with test results.
+        """
+        results = {
+            'direct_access': False,
+            'proxy_reachable': False,
+            'proxy_login_page': False,
+            'needs_auth': False,
+            'details': []
+        }
+        
+        try:
+            import requests
+            
+            print("\n" + "="*60)
+            print("PRE-FLIGHT TESTS")
+            print("="*60)
+            
+            # Test 1: Direct access
+            print("\n→ Test 1: Direct access to article")
+            try:
+                response = requests.get(url, timeout=10, allow_redirects=True)
+                results['details'].append(f"Direct access: {response.status_code}")
+                print(f"  Status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    text_lower = response.text.lower()
+                    if 'subscription' in text_lower or 'access denied' in text_lower or 'sign in' in text_lower:
+                        print("  ✗ Access denied (paywall detected)")
+                    else:
+                        print("  ✓ Might have direct access!")
+                        results['direct_access'] = True
+            except Exception as e:
+                print(f"  ✗ Failed: {e}")
+                results['details'].append(f"Direct access failed: {e}")
+            
+            # Test 2: Proxy reachability
+            print("\n→ Test 2: Proxy server reachability")
+            try:
+                response = requests.get("https://proxy.lbl.gov", timeout=10, allow_redirects=True)
+                results['proxy_reachable'] = True
+                print(f"  ✓ Proxy responds: {response.status_code}")
+                results['details'].append(f"Proxy reachable: {response.status_code}")
+            except Exception as e:
+                print(f"  ✗ Proxy not reachable: {e}")
+                results['details'].append(f"Proxy not reachable: {e}")
+            
+            # Test 3: Proxy login page
+            print("\n→ Test 3: Proxy login URL")
+            from urllib.parse import quote
+            proxy_url = f"https://proxy.lbl.gov/login?url={quote(url)}"
+            try:
+                response = requests.get(proxy_url, timeout=10, allow_redirects=True)
+                print(f"  Status: {response.status_code}")
+                print(f"  Final URL: {response.url}")
+                results['details'].append(f"Proxy login: {response.status_code}")
+                
+                text_lower = response.text.lower()
+                if 'login' in text_lower or 'username' in text_lower or 'password' in text_lower:
+                    print("  ✓ Reached proxy login page")
+                    results['proxy_login_page'] = True
+                    results['needs_auth'] = True
+                elif 'annual reviews' in text_lower or 'article' in text_lower:
+                    print("  ✓ Got through to article (no auth needed!)")
+                    results['proxy_login_page'] = True
+                    results['needs_auth'] = False
+                else:
+                    print("  ? Unclear response")
+                    print(f"  Preview: {response.text[:200]}")
+            except Exception as e:
+                print(f"  ✗ Failed: {e}")
+                results['details'].append(f"Proxy login failed: {e}")
+            
+        except ImportError:
+            print("⚠ requests library not available, skipping HTTP tests")
+            results['details'].append("requests library not available")
+        
+        return results
         """
         Main method to fetch article using all available strategies.
         Returns (success: bool, content: Optional[str])
