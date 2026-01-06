@@ -8,7 +8,6 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 import random
-
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -20,7 +19,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # Browser automation for JavaScript rendering
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -63,21 +62,39 @@ RETRY_STRATEGY = Retry(
 
 # Domains known to block automated access - skip gracefully
 BLOCKED_DOMAINS = {
-    "annualreviews.org",  # Strict bot detection
-    "acs.org",  # ACS blocked
-    "nature.com",  # Paywall
-    "science.org",  # Science paywall
-    "sciencedirect.com",  # Elsevier paywall
-    "wiley.com",  # Wiley paywall
-    "springer.com",  # Springer paywall
-    "ieeexplore.ieee.org",  # IEEE paywall
+    "annualreviews.org", "acs.org", "science.org",
+    "sciencedirect.com", "wiley.com", "springer.com",
+    "ieeexplore.ieee.org", "nature.com", "cell.com",
+    "pnas.org", "journals.asm.org", "liebertpub.com",
+    "tandfonline.com", "sagepub.com", "karger.com"
 }
 
+CONTENT_SELECTORS = [
+    'article',
+    'main',
+    '[role="main"]',
+    '.article-body',
+    '.article-content',
+    '#article-content',
+    '.main-content',
+    '.article__body',
+    '.content-inner',
+    '#content',
+    '.fulltext-view',
+    '[data-article-body]',
+]
+
+ACCESS_DENIED_PHRASES = [
+    'access denied', '403', 'forbidden', 'not authorized',
+    'subscription required', 'purchase', 'sign in to access',
+    'institutional access required', 'paywall'
+]
+
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 ]
 
 # EZproxy for LBL institutional access (use when VPN IP access fails)
@@ -183,179 +200,408 @@ def delete_article(article_id: str) -> None:
     save_articles(articles)
 
 # ============================================================================
-# CONTENT EXTRACTION
+# CONTENT EXTRACTION WITH INTEGRATED FETCHER LOGIC
 # ============================================================================
-def extract_pdf_link_from_page(soup, base_url: str) -> Optional[str]:
-    """
-    Try to find a PDF download link from an HTML page.
-    Useful for landing pages that host PDF viewers/containers.
-    """
-    # Look for direct PDF links
-    for link in soup.find_all('a', href=True):
-        href = link.get('href', '').lower()
-        if '.pdf' in href or 'download' in href or 'pdf' in link.get_text().lower():
-            pdf_url = link['href']
-            if not pdf_url.startswith('http'):
-                pdf_url = urljoin(base_url, pdf_url)
-            if pdf_url.lower().endswith('.pdf') or 'pdf' in pdf_url.lower():
-                return pdf_url
-    
-    # Look for iframe pointing to PDF
-    for iframe in soup.find_all('iframe', src=True):
-        src = iframe['src'].lower()
-        if '.pdf' in src or 'pdf' in src:
-            pdf_url = iframe['src']
-            if not pdf_url.startswith('http'):
-                pdf_url = urljoin(base_url, pdf_url)
-            return pdf_url
-    
-    return None
+class AcademicArticleFetcher:
+    """Integrated robust fetcher for academic articles with multiple fallback strategies."""
 
-def render_with_browser(url: str, cookies: Optional[Dict] = None) -> Tuple[str, str]:
-    """
-    Render a page using browser automation for JavaScript-heavy sites.
-    Tries Playwright first, then Selenium as fallback.
-    Returns: (html_content, reason)
-    """
-    print(f"DEBUG: Starting browser automation for {url[:80]}...")
-    # Try Playwright first
-    if PLAYWRIGHT_AVAILABLE:
+    def __init__(self, ezproxy_username: Optional[str] = None,
+                 ezproxy_password: Optional[str] = None,
+                 headless: bool = True,
+                 debug: bool = False):
+        """Initialize fetcher with optional credentials."""
+        self.ezproxy_username = ezproxy_username or os.getenv('EZPROXY_USER')
+        self.ezproxy_password = ezproxy_password or os.getenv('EZPROXY_PASS')
+        self.headless = headless
+        self.debug = debug
+        
+        self.user_agents = USER_AGENTS
+        self.current_ua_index = 0
+
+    def check_proxy_reachable(self, proxy_host: str = "proxy.lbl.gov",
+                              port: int = 443, timeout: int = 5) -> bool:
+        """Check if proxy server is reachable."""
+        import socket
+        try:
+            socket.create_connection((proxy_host, port), timeout=timeout)
+            if self.debug:
+                print(f"✓ {proxy_host}:{port} is reachable")
+            return True
+        except (socket.timeout, socket.error) as e:
+            if self.debug:
+                print(f"✗ Cannot reach {proxy_host}:{port} - {e}")
+            return False
+
+    def check_proxy_http(self, test_url: str = "https://proxy.lbl.gov") -> bool:
+        """Check if proxy is reachable via HTTP request."""
+        try:
+            response = requests.get(test_url, timeout=10, allow_redirects=True)
+            if self.debug:
+                print(f"✓ HTTP test to {test_url}: {response.status_code}")
+            return response.status_code in [200, 302, 401, 403]
+        except Exception as e:
+            if self.debug:
+                print(f"✗ HTTP test failed: {e}")
+            return False
+
+    def check_vpn_status(self) -> bool:
+        """Check if likely connected to VPN by testing proxy reachability."""
+        import socket
+        try:
+            socket.gethostbyname("proxy.lbl.gov")
+            if self.debug:
+                print("✓ proxy.lbl.gov DNS resolves")
+            
+            if self.check_proxy_http():
+                if self.debug:
+                    print("✓ proxy.lbl.gov responds to HTTP")
+                return True
+            
+            return True
+        except:
+            return self.check_proxy_reachable()
+
+    def get_domain_info(self, url: str) -> Tuple[str, bool]:
+        """Extract domain and check if it's in blocked list."""
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().replace('www.', '')
+        needs_proxy = any(blocked in domain for blocked in BLOCKED_DOMAINS)
+        return domain, needs_proxy
+
+    def generate_ezproxy_urls(self, url: str) -> list:
+        """Generate different EZproxy URL formats to try."""
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        
+        urls = []
+        urls.append(("login_url", f"https://proxy.lbl.gov/login?url={quote(url)}"))
+        prefix_url = url.replace("://", f"://{domain}.proxy.lbl.gov/")
+        urls.append(("prefix", prefix_url))
+        subdomain_url = url.replace(f"://{domain}", f"://proxy-lbl-gov.{domain}")
+        urls.append(("subdomain", subdomain_url))
+        
+        return urls
+
+    def test_proxy_access(self, url: str) -> dict:
+        """Test proxy access using simple HTTP requests before launching browser."""
+        results = {
+            'direct_access': False,
+            'proxy_reachable': False,
+            'proxy_login_page': False,
+            'needs_auth': False,
+            'details': []
+        }
+        
+        try:
+            print("\n" + "="*60)
+            print("PRE-FLIGHT TESTS")
+            print("="*60)
+            
+            print("\n→ Test 1: Direct access to article")
+            try:
+                response = requests.get(url, timeout=10, allow_redirects=True)
+                results['details'].append(f"Direct access: {response.status_code}")
+                print(f" Status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    text_lower = response.text.lower()
+                    if 'subscription' in text_lower or 'access denied' in text_lower or 'sign in' in text_lower:
+                        print(" ✗ Access denied (paywall detected)")
+                    else:
+                        print(" ✓ Might have direct access!")
+                        results['direct_access'] = True
+            except Exception as e:
+                print(f" ✗ Failed: {e}")
+                results['details'].append(f"Direct access failed: {e}")
+            
+            print("\n→ Test 2: Proxy server reachability")
+            try:
+                response = requests.get("https://proxy.lbl.gov", timeout=10, allow_redirects=True)
+                results['proxy_reachable'] = True
+                print(f" ✓ Proxy responds: {response.status_code}")
+                results['details'].append(f"Proxy reachable: {response.status_code}")
+            except Exception as e:
+                print(f" ✗ Proxy not reachable: {e}")
+                results['details'].append(f"Proxy not reachable: {e}")
+            
+            print("\n→ Test 3: Proxy login URL")
+            proxy_url = f"https://proxy.lbl.gov/login?url={quote(url)}"
+            try:
+                response = requests.get(proxy_url, timeout=10, allow_redirects=True)
+                print(f" Status: {response.status_code}")
+                print(f" Final URL: {response.url}")
+                results['details'].append(f"Proxy login: {response.status_code}")
+                
+                text_lower = response.text.lower()
+                if 'login' in text_lower or 'username' in text_lower or 'password' in text_lower:
+                    print(" ✓ Reached proxy login page")
+                    results['proxy_login_page'] = True
+                    results['needs_auth'] = True
+                elif 'annual reviews' in text_lower or 'article' in text_lower:
+                    print(" ✓ Got through to article (no auth needed!)")
+                    results['proxy_login_page'] = True
+                    results['needs_auth'] = False
+                else:
+                    print(" ? Unclear response")
+                    print(f" Preview: {response.text[:200]}")
+            except Exception as e:
+                print(f" ✗ Failed: {e}")
+                results['details'].append(f"Proxy login failed: {e}")
+            
+        except ImportError:
+            print("⚠ requests library not available, skipping HTTP tests")
+            results['details'].append("requests library not available")
+        
+        return results
+
+    def try_authentication(self, page) -> bool:
+        """Attempt to authenticate on EZproxy login page."""
+        if not self.ezproxy_username or not self.ezproxy_password:
+            print("⚠ No EZproxy credentials provided")
+            return False
+        
+        login_selectors = [
+            ('input[name="user"]', 'input[name="pass"]', 'input[type="submit"]'),
+            ('input[name="username"]', 'input[name="password"]', 'input[type="submit"]'),
+            ('#username', '#password', 'button[type="submit"]'),
+            ('input[id*="user"]', 'input[id*="pass"]', 'button'),
+        ]
+        
+        for user_sel, pass_sel, submit_sel in login_selectors:
+            try:
+                if page.locator(user_sel).count() > 0:
+                    print(f" → Found login form, attempting authentication...")
+                    page.fill(user_sel, self.ezproxy_username, timeout=5000)
+                    page.fill(pass_sel, self.ezproxy_password, timeout=5000)
+                    page.click(submit_sel, timeout=5000)
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    print(f" → After auth: {page.url}")
+                    return True
+            except Exception as e:
+                if self.debug:
+                    print(f" → Auth attempt failed with selectors {user_sel}: {e}")
+                continue
+        
+        return False
+
+    def extract_content(self, page) -> Optional[str]:
+        """Try to extract article content using multiple selectors."""
+        for selector in CONTENT_SELECTORS:
+            try:
+                element = page.locator(selector).first
+                content = element.inner_text(timeout=3000)
+                if len(content) > 200:
+                    if self.debug:
+                        print(f" ✓ Content extracted using '{selector}': {len(content)} chars")
+                    return content
+            except:
+                continue
+        return None
+
+    def check_access_denied(self, page) -> bool:
+        """Check if page shows access denied messages."""
+        try:
+            page_text = page.inner_text('body', timeout=5000).lower()
+            for phrase in ACCESS_DENIED_PHRASES:
+                if phrase in page_text:
+                    if self.debug:
+                        print(f" ✗ Found access denied phrase: '{phrase}'")
+                    return True
+        except:
+            pass
+        return False
+
+    def get_user_agent(self) -> str:
+        """Get next user agent from rotation."""
+        ua = self.user_agents[self.current_ua_index]
+        self.current_ua_index = (self.current_ua_index + 1) % len(self.user_agents)
+        return ua
+
+    def try_fetch_with_method(self, url: str, method_name: str) -> Tuple[bool, Optional[str]]:
+        """Try to fetch article using a specific method."""
+        print(f"\n{'='*60}")
+        print(f"Method: {method_name}")
+        print(f"{'='*60}")
+        
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(
-                    headless=True,
+                    headless=self.headless,
                     args=[
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
-                        '--disable-accelerated-2d-canvas',
-                        '--no-first-run',
-                        '--no-zygote',
-                        '--disable-gpu'
                     ]
                 )
+                
                 context = browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    user_agent=self.get_user_agent(),
                     viewport={'width': 1920, 'height': 1080},
                     locale='en-US',
-                    timezone_id='America/Los_Angeles'
+                    timezone_id='America/Los_Angeles',
+                    # Additional fingerprinting resistance
+                    extra_http_headers={
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1',
+                        'Upgrade-Insecure-Requests': '1',
+                    }
                 )
-                
-                # Add cookies if provided
-                if cookies:
-                    domain = url.split('//', 1)[1].split('/')[0]
-                    for name, value in cookies.items():
-                        context.add_cookies([{
-                            'name': name,
-                            'value': value,
-                            'domain': domain,
-                            'path': '/'
-                        }])
                 
                 page = context.new_page()
-                page.goto(url, wait_until='networkidle', timeout=30000)
                 
-                # Wait a bit for dynamic content
+                print(f"→ Navigating to: {url}")
+                
+                try:
+                    response = page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                    print(f" Status: {response.status}")
+                    print(f" Final URL: {page.url}")
+                except PlaywrightTimeout:
+                    print(" ✗ Timeout - page took too long to load")
+                    browser.close()
+                    return False, None
+                except Exception as e:
+                    print(f" ✗ Navigation failed: {str(e)}")
+                    browser.close()
+                    return False, None
+                
+                if "login" in page.url.lower():
+                    print(" → Login page detected")
+                    if not self.try_authentication(page):
+                        print(" ✗ Authentication failed or not attempted")
+                        browser.close()
+                        return False, None
+                
                 page.wait_for_timeout(2000)
                 
-                html = page.content()
-                browser.close()
+                if self.check_access_denied(page):
+                    print(" ✗ Access denied detected on page")
+                    browser.close()
+                    return False, None
                 
-                if html and len(html) > 500:
-                    return html, "Rendered with Playwright"
+                content = self.extract_content(page)
+                
+                if content and len(content) > 200:
+                    print(f" ✓ SUCCESS: Extracted {len(content)} characters")
+                    print(f" Preview: {content[:200]}...")
+                    
+                    if self.debug:
+                        screenshot_name = f"success_{method_name.replace(' ', '_')}.png"
+                        page.screenshot(path=screenshot_name)
+                        print(f" → Screenshot saved: {screenshot_name}")
+                    
+                    browser.close()
+                    return True, content
                 else:
-                    return "", "Playwright rendered but page content empty"
+                    print(" ✗ No substantial content found")
+                    
+                    screenshot_name = f"failed_{method_name.replace(' ', '_')}.png"
+                    page.screenshot(path=screenshot_name)
+                    print(f" → Screenshot saved: {screenshot_name}")
+                    
+                    browser.close()
+                    return False, None
+                
         except Exception as e:
-            return "", f"Playwright rendering failed: {str(e)[:80]}"
-    
-    # Fallback to Selenium
-    if SELENIUM_AVAILABLE:
-        try:
-            # Setup Chrome options for headless mode
-            options = Options()
-            options.add_argument("--headless")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--window-size=1920,1080")
-            
-            # Try to use webdriver-manager to install a matching chromedriver
-            try:
-                if 'WEBDRIVER_MANAGER_AVAILABLE' in globals() and WEBDRIVER_MANAGER_AVAILABLE:
-                    service = Service(ChromeDriverManager().install())
-                    driver = webdriver.Chrome(service=service, options=options)
-                else:
-                    driver = webdriver.Chrome(options=options)
-            except TypeError:
-                try:
-                    driver = webdriver.Chrome(ChromeDriverManager().install(), options)
-                except Exception:
-                    driver = webdriver.Chrome(options=options)
-            
-            # Add cookies if provided
-            if cookies:
-                driver.get(url.split('//', 1)[1].split('/')[0])  # Go to domain first
-                for name, value in cookies.items():
-                    try:
-                        driver.add_cookie({"name": name, "value": value})
-                    except Exception:
-                        pass  # Cookie may not be valid for this domain
-            
-            # Set extra HTTP headers to make requests look more realistic
-            driver.execute_cdp_cmd('Network.enable', {})
-            extra_headers = {
-                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'accept-language': 'en-US,en;q=0.9',
-                'sec-ch-ua': '"Not/A)Brand";v="99", "Google Chrome";v="115", "Chromium";v="115"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-                'sec-fetch-dest': 'document',
-                'sec-fetch-mode': 'navigate',
-                'sec-fetch-site': 'none',
-                'sec-fetch-user': '?1',
-                'upgrade-insecure-requests': '1',
-            }
-            driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {'headers': extra_headers})
-            
-            # Navigate to URL
-            driver.get(url)
-            
-            # Wait for content to load
-            try:
-                WebDriverWait(driver, SELENIUM_TIMEOUT).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-            except Exception:
-                pass
-            
-            # Get rendered HTML
-            html = driver.page_source
-            driver.quit()
-            
-            if html and len(html) > 500:
-                return html, "Rendered with Selenium (fallback)"
-            else:
-                return "", "Selenium rendered but page content empty"
-        except Exception as e:
-            return "", f"Selenium rendering failed: {str(e)[:80]}"
-    
-    return "", "No browser automation available"
+            print(f" ✗ Error: {str(e)}")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return False, None
 
-def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[str, str]:
+    def fetch(self, url: str) -> Tuple[bool, Optional[str]]:
+        """Main method to fetch article using all available strategies."""
+        print(f"\n{'='*60}")
+        print(f"FETCHING: {url}")
+        print(f"{'='*60}")
+        
+        domain, needs_proxy = self.get_domain_info(url)
+        print(f"Domain: {domain}")
+        print(f"Needs proxy: {needs_proxy}")
+        
+        vpn_connected = self.check_vpn_status()
+        print(f"VPN/Proxy reachable: {vpn_connected}")
+        
+        test_results = self.test_proxy_access(url)
+        
+        print("\n" + "="*60)
+        print("STRATEGY SELECTION")
+        print("="*60)
+        
+        if test_results['direct_access']:
+            print("✓ Pre-flight test suggests direct access works!")
+            print(" → Will try direct access first")
+        elif test_results['proxy_login_page'] and not test_results['needs_auth']:
+            print("✓ Pre-flight test suggests proxy works without auth!")
+            print(" → Will prioritize proxy methods")
+        elif test_results['proxy_login_page'] and test_results['needs_auth']:
+            print("⚠ Proxy requires authentication")
+            if self.ezproxy_username:
+                print(" → Will attempt login with provided credentials")
+            else:
+                print(" → No credentials provided, login may fail")
+        
+        if vpn_connected or not needs_proxy or test_results['direct_access']:
+            print("\n→ Strategy 1: Direct access")
+            success, content = self.try_fetch_with_method(url, "Direct Access")
+            if success:
+                return True, content
+        
+        if needs_proxy and vpn_connected:
+            ezproxy_urls = self.generate_ezproxy_urls(url)
+            
+            for idx, (format_name, ezproxy_url) in enumerate(ezproxy_urls, 1):
+                print(f"\n→ Strategy 2.{idx}: EZproxy ({format_name})")
+                success, content = self.try_fetch_with_method(
+                    ezproxy_url,
+                    f"EZproxy - {format_name}"
+                )
+                if success:
+                    return True, content
+                
+                time.sleep(1)
+        
+        if needs_proxy and not vpn_connected:
+            print("\n→ Strategy 3: Direct access (fallback)")
+            print(" Note: VPN not detected, but trying anyway...")
+            success, content = self.try_fetch_with_method(url, "Direct Access (Fallback)")
+            if success:
+                return True, content
+        
+        print(f"\n{'='*60}")
+        print("ALL STRATEGIES FAILED")
+        print(f"{'='*60}")
+        
+        if needs_proxy and not vpn_connected:
+            print("\n💡 Suggestions:")
+            print(" 1. Connect to LBL VPN and try again")
+            print(" 2. Verify your EZproxy credentials")
+            print(" 3. Check if the article URL is correct")
+        elif test_results['needs_auth'] and not self.ezproxy_username:
+            print("\n💡 Suggestions:")
+            print(" 1. Provide EZproxy credentials:")
+            print(" 2. Or set environment variables:")
+            print(" set EZPROXY_USER=your_username")
+            print(" set EZPROXY_PASS=your_password")
+        
+        return False, None
+
+# ============================================================================
+# FETCH AND EXTRACT WITH FETCHER
+# ============================================================================
+def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: float = 1.0, ezproxy_username: Optional[str] = None, ezproxy_password: Optional[str] = None, debug: bool = False) -> Tuple[str, str]:
+    """ 
+    Enhanced fetch using AcademicArticleFetcher logic.
     """
-    Fetch URL and extract main article text with rate limiting.
-    Only processes HTML/web pages, skips direct PDFs.
-    Returns: (content, reason) where reason explains success/failure.
-    """
-    print(f"DEBUG: Fetching {url[:80]}...")
-    print(f"DEBUG: Playwright available: {PLAYWRIGHT_AVAILABLE}, Selenium available: {SELENIUM_AVAILABLE}")
     time.sleep(delay)
     
-    # Skip direct PDF URLs - check multiple patterns
+    # Skip direct PDF URLs
     url_lower = url.lower()
-    if (url_lower.endswith('.pdf') or 
+    if (url_lower.endswith('.pdf') or
         '/pdf/' in url_lower or
         'download.pdf' in url_lower or
         '/getpdf' in url_lower or
@@ -363,247 +609,16 @@ def fetch_and_extract_html(url: str, cookies: Optional[Dict] = None, delay: floa
         'pdf=' in url_lower):
         return "", f"Skipped: PDF URL detected in path ({url[:80]})"
     
-    # Check if domain is known to block automated access
-    parsed_url = urlparse(url)
-    domain = parsed_url.netloc.lower().replace('www.', '')
-    is_blocked = False
-    for blocked_domain in BLOCKED_DOMAINS:
-        if blocked_domain in domain:
-            is_blocked = True
-            break
+    fetcher = AcademicArticleFetcher(ezproxy_username=ezproxy_username, ezproxy_password=ezproxy_password, headless=True, debug=debug)
     
-    if is_blocked:
-        url = EZPROXY_BASE + quote(url)
-        print(f"DEBUG: Rewrote blocked domain {domain} to EZproxy: {url}")
+    success, content = fetcher.fetch(url)
     
-    try:
-        s = build_session(cookies)
-        
-        # Parse URL to build smart referer
-        parsed = urlparse(url)
-        referer = f"{parsed.scheme}://{parsed.netloc}/"
-        
-        headers = {
-            "User-Agent": get_random_user_agent(),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": referer,
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
-        
-        resp = s.get(url, timeout=20, headers=headers, stream=True, allow_redirects=True)
-        resp.raise_for_status()
-        
-        ctype = resp.headers.get("content-type", "")
-        if "pdf" in ctype.lower():
-            return "", "Skipped: Content-Type is PDF (use Web Link instead)"
-
-        collected = bytearray()
-        total = 0
-        for chunk in resp.iter_content(8192):
-            if not chunk:
-                break
-            collected.extend(chunk)
-            total += len(chunk)
-            if total >= MAX_DOWNLOAD_BYTES:
-                break
-        
-        html = bytes(collected)
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 403:
-            # Try browser automation as fallback for 403
-            if PLAYWRIGHT_AVAILABLE or SELENIUM_AVAILABLE:
-                try:
-                    browser_html, browser_reason = render_with_browser(url, cookies)
-                    if browser_html and "failed" not in browser_reason.lower():
-                        try:
-                            browser_soup = BeautifulSoup(browser_html, "lxml")
-                        except Exception:
-                            browser_soup = BeautifulSoup(browser_html, "html.parser")
-                        # Try extraction
-                        article_tag = browser_soup.find("article")
-                        if article_tag:
-                            text = article_tag.get_text(separator="\n", strip=True)
-                            if len(text) > 200:
-                                return text, f"Browser automation fallback for 403 - Extracted from <article> tag"
-                        ps = [p.get_text(separator=" ", strip=True) for p in browser_soup.find_all("p")]
-                        browser_joined = "\n\n".join(ps) if ps else ""
-                        if len(browser_joined) > 200:
-                            return browser_joined, f"Browser automation fallback for 403 - Extracted from paragraph tags"
-                    return "", f"403 Forbidden - Site blocks automated requests. Browser automation also failed. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
-                except Exception:
-                    return "", f"403 Forbidden - Site blocks automated requests. Browser automation failed. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
-            else:
-                return "", "403 Forbidden - Site blocks automated requests. Try: (1) institutional login cookies, (2) VPN, (3) use Web Link option instead of PDF/Inst. Access"
-        elif e.response.status_code == 401:
-            return "", "401 Unauthorized - Authentication required. Provide valid session cookies from DevTools"
-        elif e.response.status_code == 404:
-            return "", "404 Not Found - URL may be broken or article removed"
-        elif e.response.status_code == 429:
-            return "", "429 Too Many Requests - Rate limited. Increase delay between requests"
-        return "", f"HTTP {e.response.status_code} error - Server rejected request"
-    except requests.exceptions.Timeout:
-        return "", "Timeout - Server took too long to respond (>20s)"
-    except requests.exceptions.ConnectionError:
-        return "", "Connection error - Network issue or invalid URL"
-    except Exception as e:
-        return "", f"Fetch error ({type(e).__name__}): {str(e)[:100]}"
-
-    try:
-        soup = BeautifulSoup(html, "lxml")
-    except Exception:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-        except Exception:
-            return "", "HTML parsing failed - malformed content"
-
-    # Try <article> tag
-    article_tag = soup.find("article")
-    if article_tag:
-        text = article_tag.get_text(separator="\n", strip=True)
-        if len(text) > 200:
-            return text, "Extracted from <article> tag"
-
-    # Try main or role=main
-    main_tag = soup.find("main") or soup.find(attrs={"role": "main"})
-    if main_tag:
-        text = main_tag.get_text(separator="\n", strip=True)
-        if len(text) > 200:
-            return text, "Extracted from <main> tag"
-
-    # Try largest div/section
-    candidates = soup.find_all(["div", "section", "article", "main"])
-    best = ""
-    for c in candidates:
-        t = c.get_text(separator="\n", strip=True)
-        if len(t) > len(best):
-            best = t
-    if len(best) > 200:
-        return best, "Extracted from largest content block"
-
-    # Fallback: all paragraphs
-    ps = [p.get_text(separator=" ", strip=True) for p in soup.find_all("p")]
-    joined = "\n\n".join(ps) if ps else ""
-    
-    if len(joined) > 200:
-        return joined, "Extracted from paragraph tags"
-    
-    # If content is too short or empty, try browser automation for JavaScript-rendered content
-    if len(joined) < 200:
-        if PLAYWRIGHT_AVAILABLE or SELENIUM_AVAILABLE:
-            try:
-                browser_html, browser_reason = render_with_browser(url, cookies)
-                if browser_html and "failed" not in browser_reason.lower():
-                    # Parse browser-rendered HTML
-                    try:
-                        browser_soup = BeautifulSoup(browser_html, "lxml")
-                    except Exception:
-                        browser_soup = BeautifulSoup(browser_html, "html.parser")
-                    
-                    # Try extraction strategies again on rendered content
-                    article_tag = browser_soup.find("article")
-                    if article_tag:
-                        text = article_tag.get_text(separator="\n", strip=True)
-                        if len(text) > 200:
-                            return text, f"{browser_reason} - Extracted from <article> tag"
-                    
-                    main_tag = browser_soup.find("main") or browser_soup.find(attrs={"role": "main"})
-                    if main_tag:
-                        text = main_tag.get_text(separator="\n", strip=True)
-                        if len(text) > 200:
-                            return text, f"{browser_reason} - Extracted from <main> tag"
-                    
-                    candidates = browser_soup.find_all(["div", "section", "article", "main"])
-                    best = ""
-                    for c in candidates:
-                        t = c.get_text(separator="\n", strip=True)
-                        if len(t) > len(best):
-                            best = t
-                    if len(best) > 200:
-                        return best, f"{browser_reason} - Extracted from largest content block"
-                    
-                    ps = [p.get_text(separator=" ", strip=True) for p in browser_soup.find_all("p")]
-                    browser_joined = "\n\n".join(ps) if ps else ""
-                    if len(browser_joined) > 200:
-                        return browser_joined, f"{browser_reason} - Extracted from paragraph tags"
-            except Exception:
-                pass  # Browser automation fallback failed, continue with standard response
-    
-    if len(joined) > 0:
-        suffix = f" (Note: {domain} is known to block bots - may require institutional access)" if is_blocked else ""
-        return "", f"Content too short ({len(joined)} chars, need >200) - may be paywall, login page, or JavaScript-heavy. Try: (1) institutional login, (2) VPN, (3) Web Link instead of PDF{suffix}"
+    if success and content:
+        if len(content) > MAX_ARTICLE_TEXT:
+            content = content[:MAX_ARTICLE_TEXT] + "\n\n...[truncated]"
+        return content, "Extracted using AcademicArticleFetcher"
     else:
-        suffix = f" (Note: {domain} is known to block bots - may require institutional access)" if is_blocked else ""
-        return "", f"No readable content found - page may require JavaScript (install: pip install playwright selenium), be behind paywall, or is a PDF landing page{suffix}"
-
-def download_file(url: str, dest: Path, cookies: Optional[Dict] = None, delay: float = 1.0) -> Tuple[bool, str]:
-    """
-    Download a file with rate limiting.
-    Returns: (success, reason)
-    """
-    time.sleep(delay)
-    
-    s = build_session(cookies)
-    headers = {
-        "User-Agent": get_random_user_agent(),
-        "Accept": "application/pdf,*/*",
-    }
-    
-    try:
-        with s.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True) as r:
-            r.raise_for_status()
-            total = 0
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(1024 * 64):
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    total += len(chunk)
-                    if total >= MAX_PDF_BYTES:
-                        raise Exception("File exceeds max allowed size (50MB)")
-        return True, f"Downloaded {total // 1024}KB"
-    except requests.exceptions.HTTPError as e:
-        if dest.exists():
-            dest.unlink()
-        if e.response.status_code == 403:
-            return False, "403 Forbidden - PDF access requires authentication"
-        elif e.response.status_code == 404:
-            return False, "404 Not Found - PDF URL invalid"
-        return False, f"HTTP {e.response.status_code}"
-    except Exception as e:
-        if dest.exists():
-            dest.unlink()
-        return False, f"Download failed: {str(e)[:100]}"
-
-def extract_text_from_pdf(path: Path) -> Tuple[str, str]:
-    """
-    Extract text from PDF file.
-    Returns: (text, reason)
-    """
-    try:
-        reader = PdfReader(str(path))
-        if len(reader.pages) == 0:
-            return "", "PDF has no pages"
-        
-        texts = []
-        for p in reader.pages:
-            try:
-                t = p.extract_text() or ""
-            except Exception:
-                t = ""
-            if t:
-                texts.append(t)
-        
-        result = "\n\n".join(texts)
-        if len(result) > 100:
-            return result, f"Extracted from {len(reader.pages)} pages"
-        else:
-            return "", f"PDF has {len(reader.pages)} pages but no extractable text (may be scanned images)"
-    except Exception as e:
-        return "", f"PDF extraction failed: {str(e)[:100]}"
+        return "", "Failed to extract content using AcademicArticleFetcher"
 
 # ============================================================================
 # API & LINK FETCHING
@@ -726,7 +741,7 @@ def fetch_items_api(
                 url_source = "doi"
 
         if not raw_url:
-            debug_info.append(f"  [{idx}] {article_title}: ❌ No URL found")
+            debug_info.append(f" [{idx}] {article_title}: ❌ No URL found")
             continue
 
         try:
@@ -738,7 +753,7 @@ def fetch_items_api(
             continue
 
         title = a.get("title") or a.get("plainTitle") or a.get("name") or None
-        debug_info.append(f"  [{idx}] {article_title}: ✅ [{url_source}] {resolved[:70]}")
+        debug_info.append(f" [{idx}] {article_title}: ✅ [{url_source}] {resolved[:70]}")
         results.append({"url": resolved, "title": title})
         seen.add(resolved)
 
@@ -836,9 +851,12 @@ def process_article_batch(
     start_idx: int,
     cookies_dict: Optional[Dict],
     existing_urls: set,
-    rate_limit_delay: float = 2.0
+    ezproxy_username: Optional[str],
+    ezproxy_password: Optional[str],
+    rate_limit_delay: float = 2.0,
+    debug: bool = False
 ) -> Tuple[List[Dict], List[str], int]:
-    """Process a batch of articles with detailed error reporting. HTML/Web links only."""
+    """Process a batch of articles with detailed error reporting using fetcher."""
     new_articles = []
     logs = []
     imported = 0
@@ -852,9 +870,9 @@ def process_article_batch(
             logs.append(f"⏭ {global_idx}: Skipped (duplicate or no URL)")
             continue
         
-        # Skip PDF URLs - check multiple patterns
+        # Skip PDF URLs
         url_lower = url.lower()
-        if (url_lower.endswith('.pdf') or 
+        if (url_lower.endswith('.pdf') or
             '/pdf/' in url_lower or
             'download.pdf' in url_lower or
             '/getpdf' in url_lower or
@@ -867,7 +885,7 @@ def process_article_batch(
         import_reason = ""
         
         try:
-            extracted, reason = fetch_and_extract_html(url, cookies=cookies_dict, delay=rate_limit_delay)
+            extracted, reason = fetch_and_extract_html(url, cookies=cookies_dict, delay=rate_limit_delay, ezproxy_username=ezproxy_username, ezproxy_password=ezproxy_password, debug=debug)
             
             if extracted and len(extracted) > 200:
                 text = extracted
@@ -875,7 +893,6 @@ def process_article_batch(
             else:
                 logs.append(f"❌ {global_idx}: {reason}")
                 import_reason = reason
-
         except Exception as e:
             error_msg = f"Unexpected error: {type(e).__name__}: {str(e)[:100]}"
             logs.append(f"❌ {global_idx}: {error_msg}")
@@ -883,9 +900,6 @@ def process_article_batch(
             continue
 
         if text:
-            if len(text) > MAX_ARTICLE_TEXT:
-                text = text[:MAX_ARTICLE_TEXT] + "\n\n...[truncated]"
-
             new_article = {
                 "id": str(uuid.uuid4()),
                 "title": title,
@@ -926,13 +940,13 @@ def process_article_batch(
         logs.append("")
         logs.append("📊 SUMMARY: Blocked Domains")
         for domain, count in sorted(blocked_summary.items(), key=lambda x: -x[1]):
-            logs.append(f"  • {domain}: {count} articles")
+            logs.append(f" • {domain}: {count} articles")
         logs.append("")
         logs.append("💡 To access blocked content:")
-        logs.append("  1. Institutional login: Use your university/organization credentials")
-        logs.append("  2. VPN: Connect to institutional VPN to bypass geographic restrictions")
-        logs.append("  3. Library proxy: Some institutions provide proxy URLs")
-        logs.append("  4. DOI alternative: Try searching the DOI directly via https://doi.org/")
+        logs.append(" 1. Institutional login: Use your university/organization credentials")
+        logs.append(" 2. VPN: Connect to institutional VPN to bypass geographic restrictions")
+        logs.append(" 3. Library proxy: Some institutions provide proxy URLs")
+        logs.append(" 4. DOI alternative: Try searching the DOI directly via https://doi.org/")
 
     return new_articles, logs, imported
 
@@ -950,7 +964,6 @@ def run_app():
     # SIDEBAR: IMPORT & CONFIGURATION
     # ========================================================================
     st.sidebar.header("Library Import")
-
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Upload File")
@@ -980,21 +993,26 @@ def run_app():
     )
 
     with st.sidebar.expander("Authentication Cookies"):
-        st.markdown("""
-**Get cookies from DevTools:**
+        st.markdown(""" **Get cookies from DevTools:**
+
 1. Open library (logged in)
+
 2. DevTools → Application → Cookies
-3. Copy all and paste below
-""")
+
+3. Copy all and paste below """)
     
-    cookie_input = st.sidebar.text_area(
-        "Paste cookies",
-        height=100,
-        placeholder="name=value; name2=value2",
-        key="lean_cookie_input"
-    )
+        cookie_input = st.sidebar.text_area(
+            "Paste cookies",
+            height=100,
+            placeholder="name=value; name2=value2",
+            key="lean_cookie_input"
+        )
     
-    cookie_header = parse_cookies(cookie_input)
+        cookie_header = parse_cookies(cookie_input)
+
+    with st.sidebar.expander("EZProxy Credentials"):
+        ezproxy_username = st.text_input("EZProxy Username", key="ezproxy_username")
+        ezproxy_password = st.text_input("EZProxy Password", type="password", key="ezproxy_password")
 
     st.sidebar.markdown("---")
     rate_limit_delay = st.sidebar.slider(
@@ -1005,6 +1023,8 @@ def run_app():
         step=0.5,
         help="Increase if getting 403 errors"
     )
+
+    debug_mode = st.sidebar.checkbox("Debug Mode", key="debug_mode")
 
     if st.sidebar.button("✓ Validate Cookies"):
         if not cookie_input:
@@ -1111,7 +1131,11 @@ def run_app():
             cookies_dict = cookie_header_to_dict(cookie_header)
             
             new_articles, logs, imported = process_article_batch(
-                sublist, start, cookies_dict, existing_urls, rate_limit_delay
+                sublist, start, cookies_dict, existing_urls, 
+                ezproxy_username=st.session_state.get("ezproxy_username"),
+                ezproxy_password=st.session_state.get("ezproxy_password"),
+                rate_limit_delay=rate_limit_delay,
+                debug=debug_mode
             )
             
             if new_articles:
@@ -1191,7 +1215,7 @@ def run_app():
         # Mass deletion options
         with st.sidebar.expander("Mass Delete"):
             st.write("**Delete by status:**")
-            col1, col2 = st.columns(2)
+            col1, col2 = st.sidebar.columns(2)
             with col1:
                 if st.button("Delete Failed", help="Remove articles that failed to import"):
                     failed_ids = [a["id"] for a in articles if a.get("import_status") == "failed"]
